@@ -656,7 +656,14 @@ const captureGoal = ({ state, cwd }: ScriptContext): Omit<Output, "meta"> => {
 const writeCommitBaseline = (cwd: string, rel: string): void => {
 	let paths: string[] = [];
 	try {
-		const out = execFileSync("git", ["status", "--short"], { cwd, encoding: "utf-8" });
+		// stdio: stderr ignored — without this, git's "fatal: not a git repository"
+		// leaks to the parent's stderr even though the catch treats it as a
+		// supported silent degrade (best-effort baseline, empty on failure).
+		const out = execFileSync("git", ["status", "--short"], {
+			cwd,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
 		paths = out
 			.split("\n")
 			.filter((l) => l.trim() !== "")
