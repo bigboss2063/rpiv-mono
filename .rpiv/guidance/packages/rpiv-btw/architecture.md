@@ -34,7 +34,15 @@ Five layered constraints keep the main transcript untouched:
 History stores **actual** `UserMessage`/`AssistantMessage` object references (never re-fabricated) and concatenates them in a deterministic order so the prefix bytes stay byte-identical across turns — this is what keeps prompt-cache hits warm. The architectural rule: **no copy, no mutate, no reorder** of any message the LLM has already seen.
 
 ## Snapshot Invalidation
-The cached branch clone is dropped on `session_compact` and `session_tree`. Without invalidation, post-compact callers would see a stale view of the conversation. Invalidation is event-driven — never time- or size-based.
+The cached branch clone is dropped on `session_compact` and `session_tree`. Without invalidation, post-compact callers would see a stale view of the conversation. Invalidation is event-driven — never time- or size-based. The snapshot carries both `{ messages, entries }`: the converted `Message[]` for fast-path prompt-cache parity, and the raw `SessionEntry[]` retained so `fitBranch`/`findCutPoint`/`getLastAssistantUsage` can re-slice the cached snapshot on retry without re-reading `ctx.sessionManager.getBranch()`.
+
+## Context Budgeting
+
+`/btw` side calls are bounded so they fit the model's context window instead of failing on long sessions or silently degrading the prompt cache.
+
+- **Fast-path parity guarantee** — when the branch fits, `buildBtwMessages` returns reference-identical cached messages plus the admitted `BtwTurn` messages (`toBe`, no copy/mutate/reorder), preserving cache warmth per the Stable-Reference Prompt-Cache Discipline rule above. Trimming only ever produces a strict subset or a stubbed copy; it never mutates the cached snapshot.
+- **Host-primitives rule** — `btw-budget.ts` value-imports the six host primitives (`calculateContextTokens`, `convertToLlm`, `estimateTokens`, `findCutPoint`, `getLastAssistantUsage`, `sessionEntryToContextMessages`) from `@earendil-works/pi-coding-agent` with no re-implementation. It deliberately does NOT reuse the host's backward `findTurnStartIndex` for the forward turn-start scan — the host's scan direction is wrong for this package's trim semantics.
+- **Single-retry rule** — exactly one overflow retry halves `keepBudget`; the rebuild re-slices the cached snapshot (never re-reads `ctx.sessionManager.getBranch()`). Legacy hosts where `isContextOverflow` is absent degrade gracefully with no retry, and never crash.
 
 ## Version-Tolerant `completeSimple` Resolution
 `executeBtw` awaits `loadCompleteSimple()` from `pi-compat.ts` — never a static import, because pi-ai resolves against the HOST's copy (peer `"*"`). It tries `@earendil-works/pi-ai/compat` first (Pi >= 0.80.1 moved the global dispatch API there), falling back to the package root ONLY on module-resolution failures (`ERR_PACKAGE_PATH_NOT_EXPORTED` / `ERR_MODULE_NOT_FOUND` / `MODULE_NOT_FOUND`, walking the error `cause` chain); any other `/compat` error rethrows so real init failures surface instead of being masked. `/compat` is temporary — when pi's ModelManager migration deletes it, `pi-compat.ts` is the single place to migrate.
