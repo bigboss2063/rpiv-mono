@@ -12,7 +12,7 @@
  *
  * Fail-soft throughout and SYNCHRONOUS: the entire body is try/caught, and on
  * ANY failure (locate miss, reader throw, write error) it warns via
- * `ctx.ui.notify(..., "warning")` / `[rpiv-workflow]` `console.warn` and
+ * `ctx.ui.notify(..., "warning")` and
  * continues — the original failure (already persisted by `writeFailureRow`)
  * is never masked. Skips SILENTLY (no throw, no artifact, no warning) when
  * `audit.session === null` (sessionless failures: entry throws, seam aborts
@@ -78,7 +78,13 @@ function sanitizeSegment(segment: string): string {
  */
 export function deathSceneFilePath(cwd: string, audit: AuditCtx): string {
 	const stageNumber = audit.allocatedStageNumber ?? audit.state.lastAllocatedStageNumber;
-	const unitSegment = sanitizeSegment(audit.unit?.id ?? audit.stageName);
+	// `unit.id` is the stable disambiguator when present (fanout/iterate). Assess-loop units
+	// carry no id (identified by `(role, round)`); append `_u<index>` so filename uniqueness
+	// does NOT depend on the decorated stageName's `r{index}·{phase}` tag — the decoration
+	// disambiguates today, but display strings are not a uniqueness contract. The whole segment
+	// (index included) is routed through sanitizeSegment so it cannot escape failures/.
+	const unitBase = audit.unit?.id ?? (audit.unit ? `${audit.stageName}_u${audit.unit.index}` : audit.stageName);
+	const unitSegment = sanitizeSegment(unitBase);
 	const runSegment = sanitizeSegment(audit.runId);
 	return join(cwd, ".rpiv", "artifacts", "failures", `${runSegment}_${stageNumber}_${unitSegment}.md`);
 }
@@ -181,8 +187,8 @@ export function formatDeathScene(scene: DeathScene): string {
  *   - `audit.readSessionBranch === undefined` — programmatic embedder / no
  *     provider; the host never injected the reader.
  *
- * WARNS + continues (`ctx.ui.notify(..., "warning")` + `[rpiv-workflow]`
- * `console.warn`) when `locateSessionFile` returns null, the reader returns
+ * WARNS + continues (`ctx.ui.notify(..., "warning")`) when
+ * `locateSessionFile` returns null, the reader returns
  * undefined/an empty branch, or any step throws — the original failure, already
  * persisted by `writeFailureRow`, is never masked.
  *
@@ -222,6 +228,5 @@ export function writeDeathSceneArtifact(ctx: WorkflowHostContext, audit: AuditCt
 	} catch (e) {
 		const reason = e instanceof Error ? e.message : String(e);
 		ctx.ui.notify(`[rpiv-workflow] death-scene artifact failed: ${reason}`, "warning");
-		console.warn("[rpiv-workflow] death-scene artifact write failed:", e);
 	}
 }

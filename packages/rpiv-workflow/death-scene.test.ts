@@ -88,6 +88,20 @@ describe("death-scene pure helpers", () => {
 		expect(path).toBe(join("/repo", ".rpiv", "artifacts", "failures", "run-1_7_build_app.md"));
 	});
 
+	it("deathSceneFilePath appends _u<index> when a unit is present but has no id (assess-loop case)", () => {
+		// Assess units are identified by (role, round) with no stable id; the decorated stageName
+		// already carries the round tag, but filename uniqueness must not depend on that decoration.
+		const path = deathSceneFilePath(
+			"/repo",
+			auditFor({
+				stageName: "assess (r1·produce)",
+				unit: { parent: "assess", role: "produce", index: 1, label: "r1·produce" },
+			}),
+		);
+		// Sanitized decorated stage name + `_u1` suffix (the round index).
+		expect(path).toBe(join("/repo", ".rpiv", "artifacts", "failures", "run-1_7_assess_(r1·produce)_u1.md"));
+	});
+
 	it("extractDeathScene carries runId/stage/errMsg/sessionFile, the last-N tool calls, and the final assistant text", () => {
 		const scene = extractDeathScene(auditFor(), "boom", branchWithToolCalls(), "/repo/sess-1.jsonl");
 		expect(scene.runId).toBe("run-1");
@@ -262,28 +276,22 @@ describe("writeDeathSceneArtifact", () => {
 	});
 
 	it("(e) warns + continues when the reader throws", () => {
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-		try {
-			const sessionFile = join(tmpDir, "2026-01-01T00-00-00-000Z_sess-1.jsonl");
-			writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: "sess-1" })}\n`, "utf8");
-			const { ctx, notifications } = makeCtx();
-			const reader = vi.fn(() => {
-				throw new Error("disk read failed");
-			});
-			writeDeathSceneArtifact(
-				ctx,
-				auditFor({ session: { id: "sess-1", file: sessionFile }, readSessionBranch: reader }),
-				"boom",
-			);
-			expect(reader).toHaveBeenCalled();
-			expect(notifications.some((n) => n.level === "warning" && n.msg.includes("death-scene artifact failed"))).toBe(
-				true,
-			);
-			expect(warnSpy).toHaveBeenCalled();
-			expect(existsSync(failuresDir())).toBe(false);
-		} finally {
-			warnSpy.mockRestore();
-		}
+		const sessionFile = join(tmpDir, "2026-01-01T00-00-00-000Z_sess-1.jsonl");
+		writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: "sess-1" })}\n`, "utf8");
+		const { ctx, notifications } = makeCtx();
+		const reader = vi.fn(() => {
+			throw new Error("disk read failed");
+		});
+		writeDeathSceneArtifact(
+			ctx,
+			auditFor({ session: { id: "sess-1", file: sessionFile }, readSessionBranch: reader }),
+			"boom",
+		);
+		expect(reader).toHaveBeenCalled();
+		expect(notifications.some((n) => n.level === "warning" && n.msg.includes("death-scene artifact failed"))).toBe(
+			true,
+		);
+		expect(existsSync(failuresDir())).toBe(false);
 	});
 
 	it("(f) no-regression — a clean run (writer never called) creates no failures directory", () => {

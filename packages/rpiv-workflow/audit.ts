@@ -119,6 +119,24 @@ function writeFailureRow(
 	return written;
 }
 
+/**
+ * Record the two failure-forensics sidecars for a failed stage/unit — the
+ * in-memory failure memo (`appendFailureMemo`) and the death-scene `.md`
+ * artifact (`writeDeathSceneArtifact`) — immediately after the failure-row
+ * write. Peer helper to `writeFailureRow`; the two terminal writers
+ * (`recordTerminalFailure`, `recordUnitHalt`) both delegate here.
+ *
+ * Fail-soft: the death-scene artifact reads the just-failed session's persisted
+ * JSONL via the host-injected `audit.readSessionBranch`; skips silently when
+ * sessionless / no reader; notifies + continues on any miss/throw so the
+ * already-persisted failure row is never masked. The memo append is in-memory
+ * only and does not throw.
+ */
+function recordFailureForensics(ctx: WorkflowHostContext, audit: AuditCtx, errMsg: string): void {
+	appendFailureMemo(audit.state, audit, errMsg);
+	writeDeathSceneArtifact(ctx, audit, errMsg);
+}
+
 export async function recordTerminalFailure(
 	ctx: WorkflowHostContext,
 	audit: AuditCtx,
@@ -146,12 +164,7 @@ export async function recordTerminalFailure(
 		session: audit.session,
 		...unitRowFields(audit.unit),
 	});
-	appendFailureMemo(audit.state, audit, args.errMsg);
-	// Write the death-scene artifact (fail-soft sidecar `.md`) immediately
-	// after the memo. Reads the just-failed session's persisted JSONL via the host-injected
-	// `audit.readSessionBranch`; skips silently when sessionless / no reader; warns + continues
-	// on any miss/throw so the already-persisted failure row is never masked.
-	writeDeathSceneArtifact(ctx, audit, args.errMsg);
+	recordFailureForensics(ctx, audit, args.errMsg);
 	ctx.ui.notify(args.notifyMsg, args.notifyLevel);
 	onFailure?.(ctx);
 	terminate(audit.state, { status: args.status, error: args.errMsg });
@@ -182,10 +195,7 @@ export function recordUnitHalt(ctx: WorkflowHostContext, audit: AuditCtx, errMsg
 		session: audit.session,
 		...unitRowFields(audit.unit),
 	});
-	appendFailureMemo(audit.state, audit, errMsg);
-	// Write the death-scene artifact (fail-soft sidecar `.md`) for a soft-halted
-	// collect-all unit. Same fail-soft contract as `recordTerminalFailure`'s call above.
-	writeDeathSceneArtifact(ctx, audit, errMsg);
+	recordFailureForensics(ctx, audit, errMsg);
 }
 
 /**
