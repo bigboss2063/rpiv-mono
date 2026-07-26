@@ -95,7 +95,7 @@ describe("buildUnitSession — collectAll is fanout-only (F1 regression)", () =>
 	const runFull = {
 		cwd: "/tmp",
 		runId: "r1",
-		state: {} as RunState,
+		state: { failureMemos: [] } as unknown as RunState,
 		lifecycle: {} as RunContext["lifecycle"],
 		workflow: { name: "wf" },
 		totalStages: 1,

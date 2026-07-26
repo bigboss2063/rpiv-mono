@@ -30,6 +30,7 @@ import { decorateStage, runIdentityOf } from "./audit.js";
 // reconstruct byte-identical declared-order state regardless of
 // completion/resume order. iterate/assess keep advanceCursor (sequential).
 import { placeFanoutOutput, resolveStagePrompt } from "./chain-state.js";
+import { failureMemoSuffix } from "./failure-memos.js";
 import { type Artifact, handleToString } from "./handle.js";
 import { isPanel, type Judge, type PanelJudge, panelMembers, resolveJudgePrompt } from "./judge.js";
 import { MSG_LOOP_CURSOR_CORRUPT } from "./messages.js";
@@ -493,7 +494,7 @@ export function buildUnitSession(
 		cwd: run.cwd,
 		runId: run.runId,
 		state: run.state,
-		prompt: u.prompt,
+		prompt: u.prompt + failureMemoSuffix(run.state),
 		stageName: decorateStage(e.name, u.tag), // DISPLAY only — machine identity is `unit`
 		skill: u.skill,
 		lifecycle: run.lifecycle,
@@ -506,6 +507,7 @@ export function buildUnitSession(
 		unit: { parent: e.name, role: u.role, index, id: u.id, label: u.label },
 		model: run.resolveModel?.({ stage: e.name, skill: u.skill }),
 		signal,
+		readSessionBranch: run.readSessionBranch,
 		collectAll: shouldCollectAll(e.loop),
 		laneUnitIndex: laneIndexFor(e.loop, index),
 		onFailure: undefined,

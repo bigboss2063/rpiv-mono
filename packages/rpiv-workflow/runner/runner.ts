@@ -43,6 +43,7 @@ import {
 	writeHeader,
 } from "../state/index.js";
 import { childSessionsDir } from "../state/paths.js";
+import type { BranchEntry } from "../transcript.js";
 import { DEFAULT_TRIGGER } from "../triggers.js";
 import type { RunContext, RunWorkflowOptions, RunWorkflowResult } from "../types.js";
 import { reconstructState } from "./resume.js";
@@ -120,6 +121,7 @@ function referencedSessionIds(run: RunContext): Set<string> {
 interface DetachedExecutor {
 	execCtx: WorkflowHostContext;
 	resolveModel?: (id: { stage: string; skill: string }) => ModelSelection | undefined;
+	readSessionBranch?: (file: string) => BranchEntry[] | undefined;
 	signal?: AbortSignal;
 	dispose?: () => void;
 }
@@ -148,6 +150,7 @@ async function detachExecutor(
 	runId: string,
 	options: {
 		resolveModel?: (id: { stage: string; skill: string }) => ModelSelection | undefined;
+		readSessionBranch?: (file: string) => BranchEntry[] | undefined;
 		signal?: AbortSignal;
 		name?: string; // lane display name (run --name ?? workflow name)
 		/** Workflow name (the dock's dim `workflow:` tag); threaded from workflow.name / header.workflow. */
@@ -157,7 +160,13 @@ async function detachExecutor(
 	},
 ): Promise<DetachedExecutor> {
 	const provider = getWorkflowExecutionProvider();
-	if (!provider) return { execCtx: ctx, resolveModel: options.resolveModel, signal: options.signal };
+	if (!provider)
+		return {
+			execCtx: ctx,
+			resolveModel: options.resolveModel,
+			readSessionBranch: options.readSessionBranch,
+			signal: options.signal,
+		};
 	// Resolve the run-scoped session dir here (internal layout helper) and hand the
 	// provider a concrete string; rpiv-pi never imports childSessionsDir.
 	const exec = await provider.createHost(ctx, {
@@ -171,6 +180,7 @@ async function detachExecutor(
 		execCtx: exec.host,
 		dispose: exec.dispose,
 		resolveModel: options.resolveModel ?? provider.resolveModel,
+		readSessionBranch: options.readSessionBranch ?? provider.readSessionBranch,
 		signal: options.signal ?? exec.signal, // provider-owned abort handle
 	};
 }
@@ -237,7 +247,7 @@ export async function runWorkflow(ctx: WorkflowHostContext, options: RunWorkflow
 	}
 
 	// Detach to the executor host (the executor relays UI back to the live session).
-	const { execCtx, resolveModel, signal, dispose } = await detachExecutor(ctx, cwd, runId, {
+	const { execCtx, resolveModel, readSessionBranch, signal, dispose } = await detachExecutor(ctx, cwd, runId, {
 		...options,
 		name: options.name ?? workflow.name,
 		workflow: workflow.name,
@@ -251,7 +261,7 @@ export async function runWorkflow(ctx: WorkflowHostContext, options: RunWorkflow
 		const run = buildRunContext(
 			cwd,
 			workflow,
-			{ ...options, resolveModel, signal },
+			{ ...options, resolveModel, readSessionBranch, signal },
 			{
 				runId,
 				state: freshRunState(options.input),
@@ -324,7 +334,7 @@ export async function resumeWorkflow(
 	// pending-fanout re-dispatch, or a cold-routed continue fork) runs against the
 	// real executor, not the bare launcher ctx. Same run id ⇒ same childSessionsDir,
 	// so reattach/fork resolve the original run's persisted child sessions.
-	const { execCtx, resolveModel, signal, dispose } = await detachExecutor(ctx, cwd, header.runId, {
+	const { execCtx, resolveModel, readSessionBranch, signal, dispose } = await detachExecutor(ctx, cwd, header.runId, {
 		...options,
 		name: header.name ?? header.workflow,
 		workflow: header.workflow,
@@ -337,7 +347,7 @@ export async function resumeWorkflow(
 		const run = buildRunContext(
 			cwd,
 			workflow,
-			{ ...options, resolveModel, signal },
+			{ ...options, resolveModel, readSessionBranch, signal },
 			{
 				runId: header.runId, // SAME run — new rows append to the same file
 				state: recon.state,

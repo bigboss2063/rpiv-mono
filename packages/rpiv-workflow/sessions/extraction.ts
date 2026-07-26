@@ -21,7 +21,12 @@ import { lifecycleCtxFromSession } from "../events.js";
 import type { Artifact } from "../handle.js";
 import { assertNever, formatError, nowIso, withTimeout } from "../internal-utils.js";
 import { isJsonSchemaObject, jsonSchemaToStandard } from "../json-schema.js";
-import { ERR_COLLECTOR_THREW, ERR_PARSER_THREW, ERR_SCHEMA_TIMEOUT } from "../messages.js";
+import {
+	ERR_COLLECTOR_THREW,
+	ERR_PARSER_THREW,
+	ERR_SCHEMA_TIMEOUT,
+	ERR_VALIDATE_RETRY_UNCHANGED,
+} from "../messages.js";
 import { sideEffectOutcome } from "../outcomes/index.js";
 import { finalizeOutput, type Output, outputMeta } from "../output.js";
 import type { CollectCtx, Outcome } from "../output-spec.js";
@@ -41,6 +46,7 @@ import {
 	validateOutputData,
 } from "../validate-output.js";
 import { clampRange } from "../validation-bounds.js";
+import { resolveDigest } from "../worktree-digest.js";
 import { resendIntoChild } from "./spawn.js";
 
 /**
@@ -306,6 +312,14 @@ async function retryUntilValid(
 				return { kind: "ok", result: validation.result };
 			},
 			onRetry: async (attempt, failures) => {
+				// Validation-retry mechanism-1: capture the worktree digest AT THE FAILED
+				// VALIDATE before the agent is re-prompted. Nothing mutates the tree
+				// between `validate` failing and `onRetry` opening, so this equals
+				// the digest at the failure. Captured per-retry (NOT once before the
+				// loop): a later retry's "before" state is the tree AFTER the prior
+				// retry's fix, so a single pre-loop baseline would compare against a
+				// stale tree and false-abort every later retry.
+				const baselineDigest = resolveDigest(s.worktreeDigest, s.cwd);
 				// onStageRetry fires before the agent is re-prompted; `attempt` is 1-based.
 				// Ref shares the activation's ALLOCATOR number (currentStageRef) so
 				// listeners can correlate this retry with the end/error event it
@@ -313,10 +327,23 @@ async function retryUntilValid(
 				await s.lifecycle.fire(ctx, "onStageRetry", currentStageRef(s), attempt, lifecycleCtxFromSession(s));
 				try {
 					await askAgentToFix(ctx, s, attempt, failures, timeoutMs);
-					return { kind: "ok" };
 				} catch (e) {
 					return { kind: "aborted", abort: { kind: "fatal", message: formatError(e) } };
 				}
+				// The agent was asked to fix but changed nothing observable in the
+				// worktree (tracked files OR gitignored artifacts under
+				// `.rpiv/artifacts/`, both hashed by `computeWorktreeDigest`), so the
+				// `produce(attempt)` re-read + re-validate cycle would just re-run the
+				// same failing validation — fail fast instead of looping. An unchanged
+				// `undefined` digest (non-repo / git missing) ALWAYS proceeds: degrade
+				// on a missing signal, never skip.
+				if (baselineDigest !== undefined && resolveDigest(s.worktreeDigest, s.cwd) === baselineDigest) {
+					return {
+						kind: "aborted",
+						abort: { kind: "fatal", message: ERR_VALIDATE_RETRY_UNCHANGED(s.skill) },
+					};
+				}
+				return { kind: "ok" };
 			},
 		},
 	);

@@ -15,6 +15,7 @@ import { lifecycleCtxFromSession, skillStageRef, type UnitEvent } from "../event
 import type { Output } from "../output.js";
 import type { SessionRef } from "../state/index.js";
 import type { StageSession, WorkflowHostContext } from "../types.js";
+import { bashTimeoutStrikeHistory } from "./bash-strikes.js";
 
 /**
  * Returns true on successful write — caller gates `onSuccess` on this so the
@@ -42,6 +43,10 @@ export async function recordStageSuccess(
 	output: Output,
 	session: SessionRef | null,
 ): Promise<boolean> {
+	// The strike history (count + per-strike reasons) lands on the completed
+	// row ONLY when the session consumed bash strikes; zero strikes ⇒ undefined ⇒ the
+	// spread contributes nothing ⇒ byte-identical row to today.
+	const strikeHistory = bashTimeoutStrikeHistory(s);
 	const persisted = persistStageSuccess(
 		s.state,
 		{
@@ -53,6 +58,7 @@ export async function recordStageSuccess(
 			session,
 			unit: s.unit,
 			preAllocated: s.allocatedStageNumber,
+			...(strikeHistory ? { bashTimeoutStrikes: strikeHistory } : {}),
 		},
 		s.stage,
 	);

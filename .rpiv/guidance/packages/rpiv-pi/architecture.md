@@ -34,6 +34,28 @@ Sibling-plugin commands are registered by the siblings themselves once installed
 
 rpiv-pi augments Pi with a research → design → implement skill pipeline plus the runtime infrastructure those skills depend on (guidance injection, git-context injection, scaffolding, bundled-agent sync). rpiv-core also contributes five built-in `/wf` workflows (ship/build/arch/vet/polish) to the `@juicesharp/rpiv-workflow` sibling via `registerBuiltInWorkflows`, and a model-management subsystem (`/rpiv-models`, per-skill/preset model + effort overrides, `models.json`). `/wf` stages run in detached child sessions with bounded parallel fan-out (`sdk-workflow-host.ts` — the sole module importing Pi SDK session machinery; the interactive session stays a launcher/observer), monitored via an always-on lane dock below the editor and the `/lanes` browser, with per-lane question parking and an optional Warp question-lifecycle bridge (`workflow-question-warp-bridge.ts`). Tool surfaces live in sibling plugins.
 
+## Failure-Path Resilience (host counterparts)
+
+The detached-execution host (`sdk-workflow-host.ts`) supplies the two host-side
+surfaces the `rpiv-workflow` failure-resilience ladder consumes:
+
+- **`resetToolTimeout` on the workflow-execution host port.** Beside the
+  existing `toolTimeout` verdict channel (which reports that a watchdog aborted
+  a runaway bash), the host now wires `resetToolTimeout: () => watchdog.reset()`.
+  `BashWatchdog.reset()` clears the watchdog's `fired` flag and pending timers
+  WITHOUT unsubscribing the live `tool_execution_start` listener, so a resumed
+  turn's new bash call re-arms a fresh per-`toolCallId` timer on the same handle
+  — enabling strike-based recovery inside `rpiv-workflow`'s `postStage` without a
+  second child spawn. The watchdog is the same handle armed once per child and
+  disposed in the `finally`.
+- **`readSessionBranch` on the workflow-execution host port.** A host-injected
+  reader backed by `SessionManager.open(file).getBranch()`, narrowed to
+  `BranchEntry[]` and wrapped to fail soft (`undefined` on any throw). It lets
+  `rpiv-workflow`'s death-scene artifact writer render a failed stage's last
+  tool calls + final assistant text + session-file path purely from the
+  persisted session JSONL, with no live-session re-query. Absent on
+  programmatic embedders / hosts without the SDK — the writer degrades silently.
+
 <important if="you are adding a new end-to-end feature (skill + agent)">
 ## Adding a Feature End-to-End
 1. Skill workflow → see `.rpiv/guidance/packages/rpiv-pi/skills/architecture.md`

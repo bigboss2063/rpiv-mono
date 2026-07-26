@@ -2,7 +2,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type AuditCtx, decorateStage, recordCancellation, recordTerminalFailure, unitRowFields } from "./audit.js";
+import {
+	type AuditCtx,
+	decorateStage,
+	failAuditWrite,
+	recordCancellation,
+	recordTerminalFailure,
+	recordUnitHalt,
+	unitRowFields,
+} from "./audit.js";
 import { LifecycleDispatcher } from "./events.js";
 import { MSG_FAILURE_ROW_DROPPED, MSG_WORKFLOW_CANCELLED } from "./messages.js";
 import { readAllStages } from "./state/index.js";
@@ -71,6 +79,7 @@ describe("recordTerminalFailure", () => {
 		stagesCompleted: 0,
 		lastAllocatedStageNumber: 0,
 		telemetry: { backwardJumps: 0, droppedRoutingRows: [], droppedFailureRows: [] },
+		failureMemos: [],
 		termination: { status: "running" },
 	});
 
@@ -189,5 +198,128 @@ describe("recordTerminalFailure", () => {
 		} finally {
 			warnSpy.mockRestore();
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Failure-memo propagation — the two terminal writers hook
+// `appendFailureMemo`; cancellation + audit-write halts do NOT.
+// ---------------------------------------------------------------------------
+
+describe("failure-memo propagation", () => {
+	let tmpDir: string;
+
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "rpiv-workflow-audit-memo-"));
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	const freshState = (): RunState => ({
+		originalInput: "x",
+		primaryArtifact: undefined,
+		output: undefined,
+		named: {},
+		stagesCompleted: 0,
+		lastAllocatedStageNumber: 0,
+		telemetry: { backwardJumps: 0, droppedRoutingRows: [], droppedFailureRows: [] },
+		failureMemos: [],
+		termination: { status: "running" },
+	});
+
+	const makeCtx = () => {
+		const notifications: Array<{ msg: string; level: string }> = [];
+		const ctx = {
+			cwd: tmpDir,
+			ui: { notify: (msg: string, level: string) => notifications.push({ msg, level }) },
+		} as unknown as WorkflowHostContext;
+		return { ctx, notifications };
+	};
+
+	const auditFor = (state: RunState, unit?: UnitRef): AuditCtx => ({
+		session: null,
+		cwd: tmpDir,
+		runId: "run-1",
+		state,
+		stageName: unit ? `${unit.parent} (${unit.label})` : "build",
+		skill: "build",
+		lifecycle: new LifecycleDispatcher(undefined),
+		runIdentity: { workflow: "wf", totalStages: 2, trigger: { kind: "programmatic" } },
+		...(unit ? { unit } : {}),
+	});
+
+	it("recordTerminalFailure appends exactly ONE memo whose errMsg matches the row", async () => {
+		const { ctx } = makeCtx();
+		const state = freshState();
+
+		await recordTerminalFailure(ctx, auditFor(state), {
+			status: "failed",
+			notifyMsg: "boom",
+			notifyLevel: "error",
+			errMsg: "build failed",
+		});
+
+		expect(state.failureMemos).toHaveLength(1);
+		expect(state.failureMemos[0]).toMatchObject({ stage: "build", errMsg: "build failed" });
+	});
+
+	it("the first-failure-wins guard prevents a duplicate memo under parallel failFast", async () => {
+		const { ctx } = makeCtx();
+		const state = freshState();
+		const audit = auditFor(state);
+
+		await recordTerminalFailure(ctx, audit, {
+			status: "failed",
+			notifyMsg: "first",
+			notifyLevel: "error",
+			errMsg: "first failure",
+		});
+		// A second sibling reaches the writer near-simultaneously — termination is
+		// no longer "running", so the first-failure-wins guard returns early BEFORE
+		// writeFailureRow + appendFailureMemo. The memo list stays at one entry.
+		await recordTerminalFailure(ctx, audit, {
+			status: "failed",
+			notifyMsg: "second",
+			notifyLevel: "error",
+			errMsg: "second failure",
+		});
+
+		expect(state.failureMemos).toHaveLength(1);
+		expect(state.failureMemos[0]!.errMsg).toBe("first failure");
+	});
+
+	it("recordUnitHalt (collect-all soft-halt) appends a memo with stage = parent + unitId", () => {
+		const { ctx } = makeCtx();
+		const state = freshState();
+		const unit: UnitRef = { parent: "implement", role: "produce", index: 1, id: "phase-2", label: "phase 2/5" };
+
+		recordUnitHalt(ctx, auditFor(state, unit), "compile error");
+
+		expect(state.failureMemos).toHaveLength(1);
+		expect(state.failureMemos[0]).toMatchObject({
+			stage: "implement", // parent (machine identity), not the decorated stageName
+			unitId: "phase-2",
+			errMsg: "compile error",
+		});
+	});
+
+	it("recordCancellation does NOT append a memo", () => {
+		const { ctx } = makeCtx();
+		const state = freshState();
+
+		recordCancellation(ctx, auditFor(state));
+
+		expect(state.failureMemos).toEqual([]); // cancellation is not a repeatable stage/unit failure
+	});
+
+	it("failAuditWrite does NOT append a memo", () => {
+		const { ctx } = makeCtx();
+		const state = freshState();
+
+		failAuditWrite(ctx, state, "build");
+
+		expect(state.failureMemos).toEqual([]); // a dropped success row is not a stage/unit failure either
 	});
 });

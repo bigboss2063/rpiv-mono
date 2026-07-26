@@ -8,6 +8,7 @@
  */
 import type { ModelSelection, WorkflowHostContext } from "./host.js";
 import { globalSlot } from "./internal-utils.js";
+import type { BranchEntry } from "./transcript.js";
 
 /** What the provider hands back per run: the detached executor, an optional
  *  cancellation `signal` (rpiv-pi wires it from `ctx.ui.onTerminalInput`),
@@ -42,6 +43,14 @@ export interface WorkflowExecutionProvider {
 	/** Per-stage model resolution (rpiv-pi's resolveStageModel) — threaded onto
 	 *  RunContext.resolveModel so the dispatcher fills each child's ModelSelection. */
 	resolveModel?(id: { stage: string; skill: string }): ModelSelection | undefined;
+	/** Re-open a persisted child-session JSONL and return its branch
+	 *  (`SessionManager.open(file).getBranch()` on the rpiv-pi side), narrowed
+	 *  to `BranchEntry[]`. Threaded onto `RunContext.readSessionBranch` so the
+	 *  death-scene artifact writer can read the just-failed session's transcript
+	 *  WITHOUT re-querying the live child (which is already torn down). Returns
+	 *  `undefined` on any open/read failure (fail-soft). Absent for programmatic
+	 *  embedders / no provider ⇒ the writer degrades silently. */
+	readSessionBranch?(file: string): BranchEntry[] | undefined;
 }
 
 // Use the SAME globalThis[Symbol.for(...)] slot mechanism as

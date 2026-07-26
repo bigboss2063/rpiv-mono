@@ -56,6 +56,32 @@ export const FAIL_VALIDATION_EXHAUSTED = (skill: string, failures: string): Fail
 	error: `${skill} output validation failed after retries: ${failures}`,
 });
 
+/**
+ * Validation-retry mechanism-1 — the agent was asked to fix the artifact but changed nothing
+ * observable in the worktree, so the `produce(attempt)` re-read + re-validate
+ * cycle would just re-run the same failing validation. Routed as the extraction
+ * retry loop's `Fatal.message` (the `{ kind: "aborted"; abort: { kind: "fatal" } }`
+ * arm of `onRetry` in `packages/rpiv-workflow/sessions/extraction.ts`), so the
+ * stage halts through the existing extraction-fatal path. Lands in
+ * `state.termination.error` + the JSONL row's `errMsg` via `haltStageOrSoftHalt`.
+ */
+export const ERR_VALIDATE_RETRY_UNCHANGED = (skill: string) =>
+	`${skill}: validation retry halted — the working tree was unchanged after the fix prompt (no observable edit detected to tracked files or .rpiv/artifacts/); refusing to re-run the same failing validation`;
+
+/**
+ * Validation-retry mechanism-2 — a schema-validated `produces` stage was re-dispatched against
+ * a worktree unchanged since its last validation failure at the same progress
+ * point (`stagesCompleted` unchanged). A `FailureText` consumed by `failedArgs`
+ * (the sessionless `recordTerminalFailure` descriptor, mirroring
+ * `checkBackwardJumpGuard` in `packages/rpiv-workflow/runner/chain-advance.ts`).
+ * The terminal skip carries the failure memo for free through the shared
+ * `recordTerminalFailure` writer hooks at `packages/rpiv-workflow/audit.ts:134`.
+ */
+export const FAIL_VALIDATE_GATE_SKIPPED = (skill: string): FailureText => ({
+	toast: `✗ ${skill} re-dispatched with no observable change since its last validation failure — stopping workflow`,
+	error: `${skill} re-dispatched with an unchanged worktree since its last schema-validation failure (no observable fix detected); halting to avoid a no-op retry loop`,
+});
+
 export const FAIL_INPUT_VALIDATION = (currentSkill: string, prevSkill: string, failures: string): FailureText => ({
 	toast: `✗ ${currentSkill} input validation failed — upstream ${prevSkill} produced invalid data`,
 	error: `Input validation failed for '${currentSkill}': upstream '${prevSkill}' produced invalid data: ${failures}`,

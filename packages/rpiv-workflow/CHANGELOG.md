@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Strike-based bash recovery.** A per-command bash watchdog tool-timeout is
+  now a recoverable tool event inside `postStage`'s aborted-stop arm: a bounded
+  strike ceiling (default 2, clamped `[1,5]` via `RPIV_BASH_TIMEOUT_STRIKES`)
+  lets the same child session retry a hung command after a steering re-prompt,
+  reusing `resendIntoChild` + the tail-recursive `postStage`. A strike budget
+  exhausted on a single command escalates to the UNCHANGED
+  `haltStageOrSoftHalt({ kind: "timeout" })` seam — byte-identical row,
+  lifecycle, and resume semantics to a single pre-resilience timeout. The host
+  port gains `resetToolTimeout?()` beside `toolTimeout?()` so a resumed turn's
+  new bash call re-arms a fresh per-`toolCallId` timer.
+- **Watchdog steering message (FR2).** On each consumed strike the recovering
+  unit is re-prompted with an explicit diagnostic: the killed-command snippet
+  + ceiling seconds (sourced from the host `reason`), strikes remaining, and
+  guidance that the command appears hung rather than slow, must not be rerun
+  verbatim, and should be diagnosed or reported; the final strike carries a
+  "rerunning consumes the final strike" warning.
+- **Strike-history observability (FR1.5).** A stage that recovers and completes
+  records an additive optional `bashTimeoutStrikes: { count; reasons }` field
+  on its existing completed `WorkflowStage` row (NOT a new row kind — zero
+  strikes ⇒ field omitted ⇒ byte-identical row; shape-filtered resume readers
+  ignore it like `errMsg`, so no `STATE_SCHEMA_VERSION` bump).
+- **Failure memo propagation (FR3).** A bounded failure memo is appended at the
+  two failure-record writers (`recordTerminalFailure`, `recordUnitHalt`) and
+  rendered as an additive prompt suffix at the two session-construction
+  chokepoints (`buildSingleStageSession`, `buildUnitSession`). Zero memos ⇒
+  empty suffix ⇒ byte-identical prompt; memos cap at a bounded count,
+  newest-first, each `errMsg` length-capped.
+- **Death-scene artifact (FR4).** On any stage/unit transition to failed, a
+  forensic Markdown artifact is written at
+  `<cwd>/.rpiv/artifacts/failures/<runId>_<stageNumber>_<unitId-or-stage>.md`
+  carrying runId, stage, unit, errMsg, the last N tool calls (name + truncated
+  args), the final assistant text, and the absolute on-disk session-file path —
+  sourced purely from the persisted session JSONL via a host-injected
+  `readSessionBranch` reader. Synchronous, fail-soft, never masks the original
+  failure; skipped on success and on sessionless failures. Sidecar `.md`, never
+  a JSONL row, never read by resume.
+- **Validation-retry gate (FR5).** A schema-validated `produces()` stage no
+  longer blind-retries against an unchanged worktree. Mechanism-1 aborts an
+  in-session schema retry when the agent edits nothing observable across
+  `askAgentToFix`; mechanism-2 records a terminal failure on re-dispatching a
+  qualifying stage whose `lastGatedDispatch` matches. The worktree digest is
+  widened to cover tracked files AND the `.rpiv/artifacts/` tree so a
+  gitignored-only artifact fix is not missed; both gates degrade to
+  always-proceed when the digest is `undefined` (non-repo / git missing).
+
 ## [2.1.0] - 2026-07-23
 
 ### Changed

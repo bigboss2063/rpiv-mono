@@ -18,7 +18,9 @@
 
 import type { AuditCtx } from "./audit-ctx.js";
 import { recordStage, unitRowFields } from "./audit-rows.js";
+import { writeDeathSceneArtifact } from "./death-scene.js";
 import { lifecycleCtxFromSession, scriptStageRef, skillStageRef } from "./events.js";
+import { appendFailureMemo } from "./failure-memos.js";
 import { handleToString } from "./handle.js";
 import { assertNever, nowIso } from "./internal-utils.js";
 import {
@@ -144,6 +146,12 @@ export async function recordTerminalFailure(
 		session: audit.session,
 		...unitRowFields(audit.unit),
 	});
+	appendFailureMemo(audit.state, audit, args.errMsg);
+	// Write the death-scene artifact (fail-soft sidecar `.md`) immediately
+	// after the memo. Reads the just-failed session's persisted JSONL via the host-injected
+	// `audit.readSessionBranch`; skips silently when sessionless / no reader; warns + continues
+	// on any miss/throw so the already-persisted failure row is never masked.
+	writeDeathSceneArtifact(ctx, audit, args.errMsg);
 	ctx.ui.notify(args.notifyMsg, args.notifyLevel);
 	onFailure?.(ctx);
 	terminate(audit.state, { status: args.status, error: args.errMsg });
@@ -174,6 +182,10 @@ export function recordUnitHalt(ctx: WorkflowHostContext, audit: AuditCtx, errMsg
 		session: audit.session,
 		...unitRowFields(audit.unit),
 	});
+	appendFailureMemo(audit.state, audit, errMsg);
+	// Write the death-scene artifact (fail-soft sidecar `.md`) for a soft-halted
+	// collect-all unit. Same fail-soft contract as `recordTerminalFailure`'s call above.
+	writeDeathSceneArtifact(ctx, audit, errMsg);
 }
 
 /**

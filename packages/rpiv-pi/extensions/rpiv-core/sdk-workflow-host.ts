@@ -433,6 +433,10 @@ export class SdkWorkflowHost implements WorkflowHostContext {
 			// runner THIS child's `aborted` stop was a tool-timeout (→ soft-halt), not a
 			// run/user abort. Undefined until/unless the watchdog fires.
 			toolTimeout: () => watchdog.timedOut(),
+			// Recovery twin: clear the verdict + pending timers so the resumed turn's next
+			// bash call re-arms a fresh per-toolCallId timer via the still-live subscribe
+			// listener. Same watchdog handle armed once per child; dispose() still runs in finally.
+			resetToolTimeout: () => watchdog.reset(),
 			sessionManager: {
 				// The transcript reader (`transcript.ts`) expects the ENVELOPED branch
 				// shape `{ type: "message", message: {...} }` (SessionEntry[]) — the same

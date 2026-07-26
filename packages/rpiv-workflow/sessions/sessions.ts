@@ -26,6 +26,7 @@
 import { WorkflowAbortError } from "../internal-utils.js";
 import { type BranchEntry, classifyStop, readBranch, readSessionRef, type StopSignal } from "../transcript.js";
 import type { StageSession, WorkflowHostContext, WorkflowSessionContext } from "../types.js";
+import { bashStrikesRemaining, bashTimeoutSteeringMessage, consumeBashStrike } from "./bash-strikes.js";
 import { produceAndValidateOutput } from "./extraction.js";
 import { haltStageOrSoftHalt } from "./halt-routing.js";
 import { branchOffsetFor, resendIntoChild, spawnChildAndRun } from "./spawn.js";
@@ -116,7 +117,24 @@ export async function postStage(
 	if (s.signal?.aborted) throw new WorkflowAbortError();
 	if (outcome.stop === "aborted") {
 		const timeout = child.toolTimeout?.();
-		if (timeout) return haltStageOrSoftHalt(obsCtx, s, { kind: "timeout", reason: timeout.reason }, session);
+		if (timeout) {
+			// Strike-based recovery: a watchdog tool-timeout is a recoverable
+			// tool event INSIDE the live (never-failed) child. While strikes remain,
+			// reset the watchdog verdict and re-prompt the SAME child with operator-grade
+			// steering, then tail-recurse postStage (offset threaded verbatim — the exact
+			// shape reattachStageSession uses). Exhaustion (consumeBashStrike false) falls
+			// through to the UNCHANGED soft-halt/terminal seam below — the failure-row
+			// writers hook (the failure memo + death-scene artifact fire for free via the
+			// shared writers). consumeBashStrike appends timeout.reason to the strike history so a
+			// recovering stage accumulates the per-strike reasons the completed row later records.
+			if (consumeBashStrike(s, timeout.reason)) {
+				child.resetToolTimeout?.();
+				const remaining = bashStrikesRemaining(s);
+				await resendIntoChild(child, bashTimeoutSteeringMessage(timeout.reason, remaining, remaining === 0));
+				return postStage(obsCtx, child, s, offset);
+			}
+			return haltStageOrSoftHalt(obsCtx, s, { kind: "timeout", reason: timeout.reason }, session);
+		}
 		throw new WorkflowAbortError();
 	}
 	// Every halt below routes through the single `haltStageOrSoftHalt` gate: a

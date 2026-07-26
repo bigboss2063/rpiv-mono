@@ -18,7 +18,8 @@
  */
 
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import type { ModelSelection, WorkflowHostContext } from "@juicesharp/rpiv-workflow";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { BranchEntry, ModelSelection, WorkflowHostContext } from "@juicesharp/rpiv-workflow";
 import { isLaneRelayUiContext } from "./lane-relay-ui.js";
 import { loadModelsConfig, resolveStageModel } from "./models-config.js";
 import { getFocusedRun, getLane, recordRun, retireRun, setLaneAbort } from "./run-lane-registry.js";
@@ -176,6 +177,18 @@ export async function registerWorkflowExecutionHostProvider(): Promise<void> {
 		registerWorkflowExecutionHost({
 			createHost: createWorkflowExecution,
 			resolveModel: ({ stage, skill }) => toModelSelection(resolveStageModel(loadModelsConfig(), { stage, skill })),
+			// Death-scene reader — re-open the just-failed session's persisted JSONL
+			// and return its branch, narrowed to the workflow-owned BranchEntry shape
+			// (the SDK's SessionEntry union carries private discriminators — the
+			// `as unknown as` double-cast mirrors transcript.ts `readBranch`, the single
+			// boundary that applies the cast). Fail-soft: any open/read error ⇒ undefined.
+			readSessionBranch: (file: string) => {
+				try {
+					return SessionManager.open(file).getBranch() as unknown as BranchEntry[] | undefined;
+				} catch {
+					return undefined;
+				}
+			},
 		});
 	} catch (err) {
 		if (isModuleNotFound(err)) return; // sibling absent — /rpiv-setup guides the user

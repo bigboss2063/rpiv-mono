@@ -75,6 +75,64 @@ Every stage runs in an isolated child session the host spawns via `WorkflowHostC
 
 Parallel fan-out rides on this: `fanout()` takes an optional `concurrency` ceiling (1 serializes) and `depArtifactFlag` (injects each dependency's artifact path into dependent prompts); units with `deps` dispatch in Kahn waves (`loop-waves.ts`); results fold in DECLARED index order so `fanin` synthesis + resume stay deterministic. Lifecycle: `onUnitHalt` fires on a collect-all soft-halt, `onRoute` receives a `bypassed` recovery-arms list, and `LifecycleContext.visited` is reconstructed from the trail on resume. Watchdog tool timeouts (`toolTimeout()` on the session ctx) route through the soft-halt gate instead of throwing `WorkflowAbortError` — resuming must not re-dispatch the runaway command.
 
+## Failure-Path Resilience
+
+Every stage/unit failure flows through a four-rung ladder —
+**recover → remember → preserve → gate** — that contains a single hung command's
+cost instead of cascading across stages:
+
+- **Recover (strikes-then-escalate).** A per-command bash watchdog
+  tool-timeout (`child.toolTimeout()` on an `aborted` stop with the signal
+  cold) is a recoverable tool event inside `postStage`'s aborted-stop arm
+  (`sessions.ts`), strictly AFTER the genuine `s.signal?.aborted` guard. A
+  bounded strike ceiling (module default 2, clamped `[1,5]` via
+  `RPIV_BASH_TIMEOUT_STRIKES`) consumes a strike, re-arms the watchdog via
+  `child.resetToolTimeout?.()`, and re-prompts the SAME child via
+  `resendIntoChild` (a steering message carrying the killed-command snippet,
+  strikes remaining, and FR2 diagnostic guidance), then tail-recurses
+  `postStage`. Strike exhaustion escalates to the UNCHANGED
+  `haltStageOrSoftHalt({ kind: "timeout" })` seam — the same row, lifecycle,
+  and resume path as a single pre-resilience timeout. A stage that recovers and
+  completes records the consumed strikes as an ADDITIVE optional
+  `bashTimeoutStrikes?: { count; reasons }` field on its completed
+  `WorkflowStage` row (zero strikes ⇒ omitted ⇒ byte-identical row; NOT a new
+  row kind, so resume's shape-filtered readers ignore it and
+  `STATE_SCHEMA_VERSION` is unchanged).
+- **Remember (additive prompt injection).** A bounded failure memo is appended
+  at the two failure-record writers (`recordTerminalFailure` /
+  `recordUnitHalt` in `audit.ts`) and rendered as an additive prompt suffix at
+  the two session-construction chokepoints (`buildSingleStageSession` in
+  `run-stage.ts`, `buildUnitSession` in `loop-kinds.ts`). The rule is
+  ADDITIVE-ONLY: the suffix appends, never replaces — zero memos ⇒ `""` ⇒
+  byte-identical prompt. A failed collect-all unit's memo therefore surfaces in
+  the NEXT sibling unit's INITIAL prompt, so the chain never proceeds blind.
+- **Preserve (death-scene artifact).** On any stage/unit transition to failed,
+  a forensic Markdown artifact is written at
+  `<cwd>/.rpiv/artifacts/failures/<runId>_<stageNumber>_<unitId-or-stage>.md`
+  immediately after the failure memo, sourced PURELY from the persisted session
+  JSONL via the host-injected `readSessionBranch` reader (no live-session
+  re-query). Synchronous and fail-soft: a missing reader, a null session, a
+  locate miss, or a reader throw degrades silently (warn + continue) and NEVER
+  masks the original failure. Sidecar `.md` — never a JSONL row, never read by
+  resume.
+- **Gate (validation-retry).** A schema-validated `produces()` stage does not
+  blind-retry against an unchanged worktree. Mechanism-1 (in `extraction.ts`'s
+  `onRetry` hook) captures the worktree digest around `askAgentToFix` and aborts
+  the retry when the agent edits nothing observable; mechanism-2 (at the top of
+  `runSingleStage`) records a terminal failure on re-dispatching a qualifying
+  stage whose `lastGatedDispatch` matches (same stage, same digest,
+  `stagesCompleted` unchanged). The digest covers tracked files AND the
+  `.rpiv/artifacts/` tree (so a gitignored-only artifact fix is not missed);
+  both gates degrade to always-proceed when the digest is `undefined`
+  (non-repo / git missing). Operator resume (`trigger.meta.resumedFrom`) is
+  excluded from both gates.
+
+The two failure-record writers in `audit.ts` are the load-bearing seam: a
+strike-exhausted failure picks up the memo and the death-scene artifact for
+FREE because it falls through the unchanged `haltStageOrSoftHalt` call into the
+same writers Phases 2 and 3 hook — the integration is structural, at the writer,
+not at the strike site.
+
 ## Public API (grouped by audience)
 
 | Audience | Key exports |

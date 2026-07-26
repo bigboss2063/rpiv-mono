@@ -130,6 +130,12 @@ export function persistStageSuccess(
 		unit?: UnitRef;
 		/** The activation's pre-allocated number (output-producing paths). */
 		preAllocated?: number;
+		/**
+		 * Strike history — written onto the completed row ONLY when the caller
+		 * supplies it (a session that consumed bash strikes). Zero strikes ⇒ the
+		 * caller omits it ⇒ spread below contributes nothing ⇒ byte-identical row.
+		 */
+		bashTimeoutStrikes?: { count: number; reasons: string[] };
 	},
 	def: StageDef,
 ): boolean {
@@ -144,6 +150,10 @@ export function persistStageSuccess(
 			output: row.output,
 			session: row.session,
 			...unitRowFields(row.unit),
+			// Propagate the additive strike-history field onto the persisted
+			// completed WorkflowStage row ONLY when the caller supplied it (zero strikes
+			// ⇒ undefined ⇒ spread contributes nothing ⇒ byte-identical row).
+			...(row.bashTimeoutStrikes ? { bashTimeoutStrikes: row.bashTimeoutStrikes } : {}),
 		},
 		state,
 		row.preAllocated,

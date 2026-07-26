@@ -59,6 +59,14 @@ export interface BashWatchdog {
 	/** The recorded timeout reason once the watchdog has fired, else `undefined`. Wired to
 	 *  `WorkflowSessionContext.toolTimeout` so the runner can divert the abort to soft-halt. */
 	timedOut(): { reason: string } | undefined;
+	/**
+	 * Clear the recorded verdict (`fired` → undefined) AND every pending per-`toolCallId`
+	 * timer WITHOUT unsubscribing — the `subscribe` listener stays live so a resumed turn's
+	 * new bash `tool_execution_start` re-arms a fresh timer. The strike-recovery path calls
+	 * this after consuming a strike (before re-prompting the child); `dispose()` (unsubscribe
+	 * + clear) still runs in the per-stage `finally`. Mirrors `dispose()` minus the unsubscribe.
+	 */
+	reset(): void;
 	/** Unsubscribe + clear any pending timers. The host calls this in its per-stage `finally`. */
 	dispose(): void;
 }
@@ -101,6 +109,14 @@ export function armBashWatchdog(session: WatchableSession, timeoutMs: number = B
 
 	return {
 		timedOut: () => fired,
+		// Recovery: clear the verdict + pending timers but KEEP the subscribe listener armed,
+		// so the resumed turn's next bash call re-arms a fresh per-toolCallId timer. dispose()
+		// (below) is the only path that unsubscribes.
+		reset: () => {
+			fired = undefined;
+			for (const timer of timers.values()) clearTimeout(timer);
+			timers.clear();
+		},
 		dispose: () => {
 			unsubscribe();
 			for (const timer of timers.values()) clearTimeout(timer);

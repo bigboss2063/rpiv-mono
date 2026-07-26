@@ -219,6 +219,11 @@ export {
 	type WorkflowHeader,
 	type WorkflowStage,
 } from "./state/index.js";
+// The persisted-session branch shape the host-injected `readSessionBranch`
+// reader returns (`WorkflowExecutionProvider.readSessionBranch` /
+// `RunContext.readSessionBranch`). Re-exported so the rpiv-pi host can name the
+// return type when it narrows `SessionManager.open(file).getBranch()`.
+export type { BranchEntry } from "./transcript.js";
 export { DEFAULT_TRIGGER, type RunTrigger } from "./triggers.js";
 export { typeboxSchema } from "./typebox-adapter.js";
 // `RunState` is deliberately NOT here — it is runner-private; user contexts

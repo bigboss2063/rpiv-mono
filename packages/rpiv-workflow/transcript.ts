@@ -114,6 +114,36 @@ export function lastAssistantStopReason(branch: BranchEntry[], offsetStart?: num
 	return undefined;
 }
 
+/**
+ * The concatenated `text` parts of the LAST assistant message in `branch`
+ * (reverse scan — the agent's final spoken turn is usually the actionable
+ * one), trimmed; `undefined` when the branch has no assistant message or its
+ * text parts are empty/absent. Pure — no I/O.
+ *
+ * Mirrors `lastAssistantStopReason` (`:106`) but joins the message's `text`
+ * parts instead of reading its stop reason. Used by the death-scene artifact
+ * writer (`death-scene.ts`) to capture the agent's final words at failure time.
+ * `offsetStart` — continue-policy stages pass the prior branch length so
+ * prior-stage entries don't leak into the result.
+ */
+export function lastAssistantText(branch: BranchEntry[], offsetStart?: number): string | undefined {
+	const start = Math.max(offsetStart ?? 0, 0);
+	for (let i = branch.length - 1; i >= start; i--) {
+		const entry = branch[i]!;
+		if (entry.type !== "message") continue;
+		if (entry.message?.role !== "assistant") continue;
+		const content = entry.message.content;
+		if (!Array.isArray(content)) return undefined;
+		const text = content
+			.filter((part) => part.type === "text" && typeof part.text === "string")
+			.map((part) => part.text!)
+			.join("\n")
+			.trim();
+		return text.length > 0 ? text : undefined;
+	}
+	return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Shared collector building blocks
 // ---------------------------------------------------------------------------

@@ -189,6 +189,11 @@ const auditFor = (s: StageSession, session: SessionRef | null): AuditCtx => ({
 	// The activation's pre-allocated stage number (set once output production
 	// began) — a failure row reuses it instead of burning a second number.
 	allocatedStageNumber: s.allocatedStageNumber,
+	// Host-injected persisted-session branch reader — the death-scene artifact
+	// writer reads it off AuditCtx. Absent for programmatic embedders / no
+	// provider (the writer degrades silently). Conditional spread keeps the
+	// common case (reader present) byte-clean and the no-provider case undefined.
+	...(s.readSessionBranch ? { readSessionBranch: s.readSessionBranch } : {}),
 	// Loop units thread their identity onto failure/cancellation rows so failed
 	// trailers carry the structured fields the resume drift guard consumes.
 	...(s.unit ? { unit: s.unit } : {}),

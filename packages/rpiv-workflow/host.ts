@@ -192,4 +192,16 @@ export interface WorkflowSessionContext extends WorkflowHostContext {
 	 * watchdog omits it and every abort stays a plain abort.
 	 */
 	toolTimeout?(): { reason: string } | undefined;
+
+	/**
+	 * Recovery-side twin of `toolTimeout`: clears the recorded verdict so the runner can
+	 * re-arm the watchdog for the resumed turn's next bash call. Set by a watchdog-equipped
+	 * host (rpiv-pi) alongside `toolTimeout`. The strike-recovery branch consumes a strike
+	 * BEFORE calling this, then re-prompts the SAME child; omitting it on a watchdog host
+	 * would leave a stale verdict that re-halts immediately. Optional + safe to widen: only
+	 * two implementors of this port exist (the SDK host + the test mock), and a host without
+	 * a watchdog still routes every abort as a plain abort (the strike branch never fires
+	 * because `toolTimeout()` returns `undefined`).
+	 */
+	resetToolTimeout?(): void;
 }

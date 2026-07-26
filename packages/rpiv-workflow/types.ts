@@ -30,6 +30,7 @@ import type { ModelSelection, WorkflowHost, WorkflowHostContext } from "./host.j
 import type { Output } from "./output.js";
 import type { SkillContractMap } from "./skill-contract.js";
 import type { SessionRef } from "./state/index.js";
+import type { BranchEntry } from "./transcript.js";
 import type { RunTrigger } from "./triggers.js";
 
 // Re-export the host port so runtime layers can pull `RunContext`,
@@ -95,6 +96,17 @@ export interface RunState {
 	 */
 	lastSession?: SessionRef;
 
+	/**
+	 * Validation-retry gate memory — the digest captured the last time a
+	 * schema-validated produces stage was dispatched, keyed with the stage name
+	 * + `stagesCompleted` at capture. TRANSIENT: not persisted to JSONL (the
+	 * resume fold reconstructs `RunState` from rows, not from a serialized
+	 * blob), so operator resume starts with a fresh gate — matching the
+	 * fresh-strike-budget policy. `undefined` until a qualifying stage is
+	 * dispatched (the gate's no-regression short-circuit).
+	 */
+	lastGatedDispatch?: { stage: string; digest: string; stagesCompleted: number };
+
 	// ── Telemetry (post-hoc only; not consulted by chain advancement) ──
 	telemetry: {
 		/**
@@ -122,6 +134,18 @@ export interface RunState {
 		 */
 		droppedFailureRows: string[];
 	};
+
+	// ── Failure memos (consumed by chain advancement — next prompt) ─────
+	/**
+	 * Bounded log of stage/unit failures this run has already incurred,
+	 * surfaced as an additive prompt suffix on every subsequently-built
+	 * stage/unit session via `failureMemoSuffix`. Empty on a clean run ⇒ the
+	 * suffix is `""` ⇒ byte-identical prompt. Capped at `MAX_FAILURE_MEMOS`
+	 * (oldest dropped); each entry's `errMsg` is length-bounded. NOT telemetry:
+	 * it is mutable bookkeeping the next agent's prompt reads, so it sits
+	 * between the telemetry block and `termination`.
+	 */
+	failureMemos: FailureMemo[];
 
 	// ── Termination (set once at end-of-run) ───────────────────────────
 	/**
@@ -155,6 +179,21 @@ export type RunTermination =
 	| { status: "failed"; error: string }
 	| { status: "aborted"; error: string }
 	| { status: "cancelled"; error: string };
+
+/**
+ * One entry in `RunState.failureMemos` — a bounded record of a stage/unit
+ * failure this run has already incurred, surfaced to the next agent's prompt
+ * as an additive suffix so the run does not repeat a dead end. `stage` is the
+ * machine identity (a loop unit's parent, or the audit `stageName` for a
+ * non-unit failure); `unitId` is set only for a loop-unit failure (the unit's
+ * stable audit id). `ts` is an ISO-8601 timestamp.
+ */
+export interface FailureMemo {
+	stage: string;
+	unitId?: string;
+	errMsg: string;
+	ts: string;
+}
 
 // ---------------------------------------------------------------------------
 // Public run envelope — options in, result out
@@ -204,6 +243,12 @@ export interface RunWorkflowOptions {
 	 * at child-session creation. Undefined ⇒ host default for every stage.
 	 */
 	resolveModel?: (id: { stage: string; skill: string }) => ModelSelection | undefined;
+	/**
+	 * Worktree-digest override for the validation-retry gate — threaded
+	 * onto `RunContext.worktreeDigest` → every `StageSession.worktreeDigest`.
+	 * Undefined ⇒ the built-in `computeWorktreeDigest` (git + artifacts).
+	 */
+	worktreeDigest?: (cwd: string) => string | undefined;
 	/**
 	 * Human-readable alias for this run. Stored in the JSONL header and the
 	 * sidecar names.json index. Rejected if already in use — the error
@@ -331,6 +376,26 @@ export interface RunContext {
 	 * creation (NOT via global mutation). Undefined ⇒ host default.
 	 */
 	resolveModel?: (id: { stage: string; skill: string }) => ModelSelection | undefined;
+	/**
+	 * Host-injected reader that re-opens a persisted child-session JSONL and
+	 * returns its branch (`SessionManager.open(file).getBranch()` on the rpiv-pi
+	 * side, narrowed to `BranchEntry[]`). Consumed by the death-scene artifact
+	 * writer at failure time (death-scene.ts) — the ONLY reader. Undefined for
+	 * programmatic embedders / no provider, in which case the writer degrades
+	 * silently (no artifact, no warning). Threaded provider → executor →
+	 * `RunContext` → `SessionContext` → `AuditCtx` → `auditFor`.
+	 */
+	readSessionBranch?: (file: string) => BranchEntry[] | undefined;
+	/**
+	 * Worktree-digest resolver injected by the embedder (tests / programmatic
+	 * embedders that want to stub the filesystem). Threaded onto every
+	 * `StageSession.worktreeDigest` and read by the validation-retry gate
+	 * (`packages/rpiv-workflow/sessions/extraction.ts` mechanism-1 +
+	 * `packages/rpiv-workflow/runner/run-stage.ts` mechanism-2) via
+	 * `resolveDigest` (`worktree-digest.ts`). Undefined ⇒ the built-in
+	 * `computeWorktreeDigest` (git + `.rpiv/artifacts/` recipe).
+	 */
+	worktreeDigest?: (cwd: string) => string | undefined;
 	maxBackwardJumps: number;
 	/**
 	 * Run-wide safety cap on loop units — clamps the effective cap of EVERY
@@ -398,6 +463,15 @@ export interface SessionContext {
 	 * output production; pre-output halts allocate at record time instead.
 	 */
 	allocatedStageNumber?: number;
+	/**
+	 * Host-injected persisted-session branch reader, threaded from
+	 * `RunContext.readSessionBranch`. Read by the death-scene artifact writer
+	 * (`writeDeathSceneArtifact`) via `AuditCtx`; absent for programmatic
+	 * embedders (the writer degrades silently). Travels FURTHER than
+	 * `resolveModel` — into `SessionContext` → `AuditCtx` → `auditFor` —
+	 * because the writer reads it from `AuditCtx` at failure time.
+	 */
+	readSessionBranch?: (file: string) => BranchEntry[] | undefined;
 }
 
 /**
@@ -439,6 +513,13 @@ export interface StageSession extends SessionContext {
 	 */
 	model?: ModelSelection;
 	/**
+	 * Worktree-digest resolver threaded from `RunContext.worktreeDigest` — read
+	 * by the validation-retry mechanism-1 gate in `packages/rpiv-workflow/sessions/extraction.ts`
+	 * (`resolveDigest(s.worktreeDigest, s.cwd)`). Undefined ⇒ built-in git +
+	 * artifacts recipe.
+	 */
+	worktreeDigest?: (cwd: string) => string | undefined;
+	/**
 	 * Per-child cooperative-abort signal. Threaded from `RunContext.signal` (the
 	 * fanout dispatcher narrows it to a per-generation controller) so
 	 * an aborted run interrupts an in-flight child, not just the between-stage
@@ -465,6 +546,26 @@ export interface StageSession extends SessionContext {
 	laneUnitIndex?: number;
 	/** Only set for continue stages — branch slice offset. */
 	branchOffset?: number;
+	/**
+	 * Per-activation bash-overrun strike-ceiling override (testability) —
+	 * `undefined` ⇒ the `BASH_TIMEOUT_STRIKES` module default. Pin to `0` in a
+	 * watchdog-contract test to force immediate exhaustion; pin to `N` to drive
+	 * a multi-strike recovery without mutating env.
+	 */
+	bashTimeoutStrikes?: number;
+	/**
+	 * Internal mutable strike counter for this activation — incremented by each
+	 * consumed bash overrun during `postStage`'s tail-recursive recovery.
+	 * `undefined` ⇒ 0; fresh on every continue/reattach (a new StageSession).
+	 */
+	bashTimeoutStrikesUsed?: number;
+	/**
+	 * Internal mutable accumulator of each consumed strike's host reason —
+	 * appended during recovery so the completed row can record the history.
+	 * `undefined` ⇒ `[]`. Lives on the session solely because it must
+	 * persist across the tail-recursive `postStage`.
+	 */
+	bashTimeoutStrikeReasons?: string[];
 	/**
 	 * Present iff this session IS one loop unit. Pre-decorated at session
 	 * construction by the driver (`stageName` carries the DISPLAY decoration;

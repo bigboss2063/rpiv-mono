@@ -302,6 +302,17 @@ export interface MockSessionStep {
 	 * enough). Default: the shared `/tmp/test-session.jsonl` stub.
 	 */
 	sessionFile?: string;
+	/**
+	 * Per-send evolution of this spawned child's branch + tool-timeout verdict —
+	 * models the in-place strike recovery (the resumed turn runs in the SAME
+	 * child, so no second spawn). Each `sendUserMessage` on this child shifts one
+	 * entry: appends its `branch` entries to the child's branch and sets the
+	 * child's current `toolTimeout()` verdict. Drive the initial overrun with the
+	 * step's own `branch`/`toolTimeout`, then drive each resumed turn here.
+	 * Absent ⇒ single-shot: the child's `toolTimeout()` stays at `step.toolTimeout`
+	 * and the branch never grows.
+	 */
+	onSend?: Array<{ branch?: unknown[]; toolTimeout?: { reason: string } | undefined }>;
 }
 
 export interface MockSessionChainOptions extends MockCtxOptions {
@@ -392,6 +403,7 @@ export function createMockSessionChain(opts: MockSessionChainOptions): MockSessi
 		branch: unknown[],
 		sessionFile?: string,
 		toolTimeout?: { reason: string },
+		onSend?: Array<{ branch?: unknown[]; toolTimeout?: { reason: string } | undefined }>,
 	): MockWorkflowCtx => {
 		const base = createMockCtx({
 			...opts,
@@ -436,6 +448,7 @@ export function createMockSessionChain(opts: MockSessionChainOptions): MockSessi
 				step.branch ?? [],
 				step.sessionFile,
 				step.toolTimeout,
+				step.onSend,
 			) as unknown as WorkflowSessionContext;
 			return options.withSession(child);
 		});
@@ -448,14 +461,41 @@ export function createMockSessionChain(opts: MockSessionChainOptions): MockSessi
 		} as Record<string, unknown>;
 
 		if (kind === "child") {
-			ctx.sendUserMessage = sendUserMessageFn;
+			// Mutable per-child state for the evolvable watchdog/recovery surface.
+			// With an `onSend` queue the branch is a COPY so appends land without
+			// aliasing the step's array; WITHOUT one the child aliases the caller's
+			// array — tests grow the branch by pushing into the array they hold (the
+			// continue-fork suite relies on this), so the copy must not sever it. The
+			// timeout verdict is a holder so `resetToolTimeout` and each `onSend`
+			// shift both take effect.
+			const childBranch = onSend ? [...branch] : branch;
+			const onSendQueue = onSend ? [...onSend] : undefined;
+			const currentTimeout: { value: { reason: string } | undefined } = { value: toolTimeout };
+			ctx.sendUserMessage = async (content: unknown) => {
+				// Delegate to the shared capture fn first (preserves `sentMessages` + any
+				// test `sendUserMessageFn.mockImplementation` override), THEN apply the
+				// per-child onSend evolution.
+				await sendUserMessageFn(content);
+				if (onSendQueue) {
+					const next = onSendQueue.shift();
+					if (next) {
+						if (next.branch) childBranch.push(...next.branch);
+						currentTimeout.value = next.toolTimeout;
+					}
+				}
+			};
 			ctx.sendMessage = vi.fn(async () => {});
-			// A watchdog-equipped host surfaces its tool-timeout verdict here; default
-			// children leave it unset so every abort stays a plain abort.
-			if (toolTimeout) ctx.toolTimeout = () => toolTimeout;
+			// Mutable tool-timeout verdict: returns the current value (initially
+			// `step.toolTimeout`, shifted by each `onSend` entry, cleared by
+			// `resetToolTimeout`). Always present on a child; returns `undefined` until a
+			// watchdog fires — back-compatible with `child.toolTimeout?.()` callers.
+			ctx.toolTimeout = () => currentTimeout.value;
+			ctx.resetToolTimeout = () => {
+				currentTimeout.value = undefined;
+			};
 			ctx.sessionManager = {
 				...((base as { sessionManager?: object }).sessionManager ?? {}),
-				getBranch: vi.fn(() => branch),
+				getBranch: vi.fn(() => childBranch),
 				// A continue stage forks the predecessor whose recorded `SessionRef.file`
 				// this reports; override only when the step declares a real file.
 				...(sessionFile !== undefined ? { getSessionFile: vi.fn(() => sessionFile) } : {}),

@@ -110,6 +110,16 @@ export interface WorkflowStage {
 	 */
 	errMsg?: string;
 	/**
+	 * Strike-history observability — present ONLY on a `status: "completed"`
+	 * row whose session recovered from one or more bash overruns: `count` is the
+	 * strikes consumed, `reasons` lists each consumed strike's host reason. An
+	 * ADDITIVE optional field (NOT a new row kind): absent ⇒ `JSON.stringify`
+	 * drops it ⇒ byte-identical row to pre-feature; the resume fold's
+	 * shape-filtered readers ignore it (like `errMsg`), so no
+	 * `STATE_SCHEMA_VERSION` bump.
+	 */
+	bashTimeoutStrikes?: { count: number; reasons: string[] };
+	/**
 	 * REQUIRED: the Pi session that backed this activation, or `null` as an
 	 * explicit statement that no session was involved (script stages,
 	 * preflight halts, seam aborts, drift failures, pre-open cancellations) —

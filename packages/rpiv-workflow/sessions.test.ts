@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { createMockSessionChain, mockAssistantMessage } from "@juicesharp/rpiv-test-utils";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { StageDef, StageSchema } from "./api.js";
+import type { StageDef, StageSchema, Workflow } from "./api.js";
 import { currentPrimaryArtifact } from "./chain-state.js";
 import { LifecycleDispatcher } from "./events.js";
 import { fs as fsHandle } from "./handle.js";
@@ -28,7 +28,9 @@ import { WorkflowAbortError } from "./internal-utils.js";
 import { FAIL_STAGE_NO_RESPONSE, FAIL_VALIDATION_EXHAUSTED, MSG_STAGE_FAILED } from "./messages.js";
 import type { Output } from "./output.js";
 import type { CollectCtx, Outcome } from "./output-spec.js";
+import { reconstructState } from "./runner/resume.js";
 import { runStageSession } from "./sessions/index.js";
+import { appendStage, STATE_SCHEMA_VERSION, type WorkflowHeader, writeHeader } from "./state/index.js";
 import { DEFAULT_TRIGGER } from "./triggers.js";
 import { typeboxSchema } from "./typebox-adapter.js";
 import type { RunState, StageSession, WorkflowHostContext } from "./types.js";
@@ -61,6 +63,7 @@ const freshRunState = (overrides: Partial<RunState> = {}): RunState => ({
 		droppedRoutingRows: [],
 		droppedFailureRows: [],
 	},
+	failureMemos: [],
 	termination: { status: "running" },
 	...overrides,
 });
@@ -1142,6 +1145,7 @@ describe("sessions — halt routing", () => {
 				stageName: "plan-grade (correctness)",
 				skill: "judge",
 				collectAll: true,
+				bashTimeoutStrikes: 0, // pre-exhausted ⇒ the single-timeout step escalates exactly as today
 				lifecycle: new LifecycleDispatcher({ onUnitHalt }),
 				unit: { parent: "plan-grade", role: "verify", index: 1, id: "correctness", label: "correctness" },
 				onSuccess,
@@ -1172,7 +1176,10 @@ describe("sessions — halt routing", () => {
 		const state = freshRunState();
 		const onFailure = vi.fn();
 
-		await runStageSession(chain.ctx as WorkflowHostContext, stageSession({ cwd: tmpDir, state, onFailure }));
+		await runStageSession(
+			chain.ctx as WorkflowHostContext,
+			stageSession({ cwd: tmpDir, state, onFailure, bashTimeoutStrikes: 0 }),
+		);
 
 		expect(onFailure).toHaveBeenCalledTimes(1);
 		expect(state.termination.error).toContain("per-command timeout");
@@ -1202,6 +1209,163 @@ describe("sessions — halt routing", () => {
 		expect(onFailure).toHaveBeenCalledTimes(1);
 		expect(chain.notifications.some((n) => n.msg === MSG_STAGE_FAILED("test"))).toBe(true);
 		expect(state.termination.error).toBe("outcome said no");
+	});
+
+	it("bash strike recovery: overrun → steering resent into the SAME child → resumed turn stops → completed + strike history", async () => {
+		const reason = "bash command exceeded the 180s per-command timeout and was aborted: `find /`";
+		const chain = createMockSessionChain({
+			cwd: tmpDir,
+			steps: [
+				{
+					// Initial spawn: the first bash call overruns.
+					branch: [mockAssistantMessage("scanning", "aborted")],
+					toolTimeout: { reason },
+					// Resumed turn after the steering resend: a normal completion, no timeout.
+					onSend: [{ branch: [mockAssistantMessage("diagnosed; all green")], toolTimeout: undefined }],
+				},
+			],
+		});
+		const state = freshRunState();
+		const onFailure = vi.fn();
+		const onSuccess = vi.fn<(ctx: WorkflowHostContext, output: Output) => Promise<void>>(async () => {});
+
+		await runStageSession(
+			chain.ctx as WorkflowHostContext,
+			stageSession({ cwd: tmpDir, state, onSuccess, onFailure }),
+		);
+
+		// The steering message was sent into the SAME child (no second spawn) and carries the steering guidance.
+		expect(chain.sentMessages.some((m) => m.includes("HUNG, not merely slow"))).toBe(true);
+		// Recovery → completion: no failure row, no onFailure, onSuccess fired once.
+		expect(onFailure).not.toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
+		// The completed row carries the strike history (count + reasons).
+		const rows = readStageRows(tmpDir);
+		const completed = rows[rows.length - 1]!;
+		expect(completed.status).toBe("completed");
+		expect(completed.bashTimeoutStrikes).toEqual({ count: 1, reasons: [reason] });
+	});
+
+	it("bash strike recovery: two overruns in one session drive per-session accounting + carry the final-strike warning on #2", async () => {
+		const reason = "bash command exceeded the 180s per-command timeout and was aborted: `find /`";
+		const chain = createMockSessionChain({
+			cwd: tmpDir,
+			steps: [
+				{
+					branch: [mockAssistantMessage("overrun 1", "aborted")],
+					toolTimeout: { reason },
+					onSend: [
+						{ branch: [mockAssistantMessage("overrun 2", "aborted")], toolTimeout: { reason } }, // strike 2 (final)
+						{ branch: [mockAssistantMessage("diagnosed; done")], toolTimeout: undefined }, // resumed turn completes
+					],
+				},
+			],
+		});
+		const state = freshRunState();
+		const onFailure = vi.fn();
+		const onSuccess = vi.fn<(ctx: WorkflowHostContext, output: Output) => Promise<void>>(async () => {});
+
+		await runStageSession(
+			chain.ctx as WorkflowHostContext,
+			stageSession({ cwd: tmpDir, state, bashTimeoutStrikes: 2, onSuccess, onFailure }),
+		);
+
+		// The final-strike warning (#2) was sent on the second steering message.
+		expect(chain.sentMessages.some((m) => m.includes("FINAL strike"))).toBe(true);
+		expect(onFailure).not.toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
+		// Both strikes consumed (per-session-activation scope, not per-command).
+		const rows = readStageRows(tmpDir);
+		expect(rows[rows.length - 1]!.bashTimeoutStrikes).toEqual({ count: 2, reasons: [reason, reason] });
+	});
+
+	it("bash strike exhaustion: with a default-2 ceiling, overrun #3 escalates to terminal fail byte-identical to today", async () => {
+		const reason = "bash command exceeded the 180s per-command timeout and was aborted: `find /`";
+		const chain = createMockSessionChain({
+			cwd: tmpDir,
+			steps: [
+				{
+					branch: [mockAssistantMessage("overrun 1", "aborted")],
+					toolTimeout: { reason },
+					onSend: [
+						{ branch: [mockAssistantMessage("overrun 2", "aborted")], toolTimeout: { reason } },
+						{ branch: [mockAssistantMessage("overrun 3", "aborted")], toolTimeout: { reason } }, // exhausts
+					],
+				},
+			],
+		});
+		const state = freshRunState();
+		const onFailure = vi.fn();
+
+		await runStageSession(
+			chain.ctx as WorkflowHostContext,
+			stageSession({ cwd: tmpDir, state, onFailure, bashTimeoutStrikes: 2 }),
+		);
+
+		// Escalation: terminal fail, the SAME {kind:"timeout"} errMsg as today.
+		expect(onFailure).toHaveBeenCalledTimes(1);
+		expect(state.termination.error).toContain("per-command timeout");
+		// No completed row ⇒ no strike-history field on any row (the timeout row is the unchanged seam).
+		const rows = readStageRows(tmpDir);
+		expect(rows.some((r) => r.bashTimeoutStrikes !== undefined)).toBe(false);
+	});
+
+	it("clean completion (zero timeouts) writes a row with NO bashTimeoutStrikes field — byte-identical to today", async () => {
+		const chain = createMockSessionChain({
+			cwd: tmpDir,
+			steps: [{ branch: [mockAssistantMessage("done")] }],
+		});
+		const state = freshRunState();
+
+		await runStageSession(
+			chain.ctx as WorkflowHostContext,
+			stageSession({ cwd: tmpDir, state, onSuccess: async () => {} }),
+		);
+
+		const rows = readStageRows(tmpDir);
+		const completed = rows[rows.length - 1]!;
+		expect(completed.status).toBe("completed");
+		expect("bashTimeoutStrikes" in completed).toBe(false); // field omitted ⇒ byte-identical row
+	});
+
+	it("a completed row carrying bashTimeoutStrikes replays through the resume fold byte-for-byte (additive — no re-dispatch)", async () => {
+		// The additive strike-history field is resume-safe: the strict resume reader's deep
+		// guard tolerates the unknown field (like errMsg) and the fold's `foldKnownStage` reads
+		// only status/output/session/stage, so the row advances stagesCompleted once with no
+		// re-dispatch and no STATE_SCHEMA_VERSION bump. Drives the real `reconstructState` fold
+		// over a hand-written trail (header + one completed side-effect stage row carrying the field).
+		const header: WorkflowHeader = {
+			runId: "run-resume-strikes",
+			workflow: "test-wf",
+			input: "x",
+			ts: "2026-01-01T00:00:00.000Z",
+			v: STATE_SCHEMA_VERSION,
+		};
+		const workflow: Workflow = {
+			name: "test-wf",
+			start: "test",
+			stages: { test: { kind: "side-effect", sessionPolicy: "fresh" } },
+			edges: { test: "stop" },
+		};
+		writeHeader(tmpDir, header);
+		appendStage(tmpDir, header.runId, {
+			stageNumber: 1,
+			stage: "test",
+			skill: "test",
+			status: "completed",
+			ts: "2026-01-01T00:00:01.000Z",
+			session: { id: "s1" },
+			bashTimeoutStrikes: {
+				count: 1,
+				reasons: ["bash command exceeded the 180s per-command timeout and was aborted: `find /`"],
+			},
+		});
+
+		const result = await reconstructState(tmpDir, workflow, header);
+
+		expect(result.ok).toBe(true); // NOT refused as malformed-row / version-mismatch
+		if (!result.ok) return; // type narrow
+		expect(result.state.stagesCompleted).toBe(1); // advanced exactly once — the field did not block the fold
 	});
 });
 

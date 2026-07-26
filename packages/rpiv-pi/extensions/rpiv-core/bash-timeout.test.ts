@@ -101,6 +101,31 @@ describe("armBashWatchdog", () => {
 		expect(wd.timedOut()?.reason).toContain("find / a");
 	});
 
+	it("reset() clears the verdict + pending timers WITHOUT unsubscribing; a later overrun re-fires with a fresh reason", () => {
+		const f = fakeSession();
+		const wd = armBashWatchdog(f.session, 1000);
+
+		// First overrun fires + records a reason.
+		f.emit(bashStart("c1", "find / a"));
+		vi.advanceTimersByTime(1000);
+		expect(f.abort).toHaveBeenCalledTimes(1);
+		expect(wd.timedOut()?.reason).toContain("find / a");
+		expect(f.subscribed()).toBe(true); // still armed
+
+		// reset() clears the verdict + any pending timers, keeps the listener live.
+		wd.reset();
+		expect(wd.timedOut()).toBeUndefined();
+
+		// A resumed turn's NEW bash call (new toolCallId) re-arms a fresh timer, overruns,
+		// and records a FRESH reason — the per-toolCallId re-arm the recovery path depends on.
+		f.emit(bashStart("c2", "find / b"));
+		expect(wd.timedOut()).toBeUndefined(); // not yet
+		vi.advanceTimersByTime(1000);
+		expect(f.abort).toHaveBeenCalledTimes(2);
+		expect(wd.timedOut()?.reason).toContain("find / b");
+		expect(wd.timedOut()?.reason).not.toContain("find / a");
+	});
+
 	it("dispose() unsubscribes and cancels a pending timer (no late abort)", () => {
 		const f = fakeSession();
 		const wd = armBashWatchdog(f.session, 1000);

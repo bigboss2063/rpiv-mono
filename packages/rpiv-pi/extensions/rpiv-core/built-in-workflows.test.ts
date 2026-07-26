@@ -414,6 +414,7 @@ describe("recordStage signals success and advances stageNumber monotonically", (
 			droppedRoutingRows: [],
 			droppedFailureRows: [],
 		},
+		failureMemos: [],
 		termination: { status: "running" },
 	});
 

@@ -10,6 +10,7 @@ import type { Workflow } from "../api.js";
 import { LifecycleDispatcher, type LifecycleListeners } from "../events.js";
 import type { ModelSelection, WorkflowHost } from "../host.js";
 import { getSkillContracts } from "../skill-contracts/index.js";
+import type { BranchEntry } from "../transcript.js";
 import type { RunTrigger } from "../triggers.js";
 import type { RunContext, RunState } from "../types.js";
 
@@ -58,6 +59,11 @@ export function freshRunState(originalInput: string): RunState {
 		stagesCompleted: 0,
 		lastAllocatedStageNumber: 0,
 		telemetry: { backwardJumps: 0, droppedRoutingRows: [], droppedFailureRows: [] },
+		failureMemos: [],
+		// Validation-retry gate memory — fresh on every entry point (operator
+		// resume starts with NO prior baseline ⇒ first qualifying dispatch
+		// proceeds, mirroring the fresh-strike-budget policy).
+		lastGatedDispatch: undefined,
 		termination: { status: "running" },
 	};
 }
@@ -84,6 +90,8 @@ export function buildRunContext(
 		lifecycle?: LifecycleListeners;
 		signal?: AbortSignal;
 		resolveModel?: (id: { stage: string; skill: string }) => ModelSelection | undefined;
+		readSessionBranch?: (file: string) => BranchEntry[] | undefined;
+		worktreeDigest?: (cwd: string) => string | undefined;
 	},
 	identity: { runId: string; state: RunState; visited: Set<string>; trigger: RunTrigger },
 ): RunContext {
@@ -108,6 +116,8 @@ export function buildRunContext(
 		lifecycle: new LifecycleDispatcher(options.lifecycle),
 		signal: options.signal,
 		resolveModel: options.resolveModel,
+		readSessionBranch: options.readSessionBranch,
+		worktreeDigest: options.worktreeDigest,
 	};
 }
 

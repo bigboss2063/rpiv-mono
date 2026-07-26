@@ -48,6 +48,7 @@ const freshState = (): RunState => ({
 	stagesCompleted: 0,
 	lastAllocatedStageNumber: 0,
 	telemetry: { backwardJumps: 0, droppedRoutingRows: [], droppedFailureRows: [] },
+	failureMemos: [],
 	termination: { status: "running" },
 });
 

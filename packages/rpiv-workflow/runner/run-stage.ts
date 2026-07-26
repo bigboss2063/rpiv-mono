@@ -21,16 +21,19 @@
  */
 
 import type { StageDef, Unit } from "../api.js";
-import { failedArgs, notifyPartialArtifacts, runIdentityOf } from "../audit.js";
+import { auditCtxFor, failedArgs, notifyPartialArtifacts, recordTerminalFailure, runIdentityOf } from "../audit.js";
 import { currentPrimaryArtifact, resolveStagePrompt, stageEntryArgs } from "../chain-state.js";
 import { lifecycleCtxFor, skillStageRef } from "../events.js";
+import { failureMemoSuffix } from "../failure-memos.js";
 import { formatError } from "../internal-utils.js";
+import { isJsonSchemaObject } from "../json-schema.js";
 import { announceLoopStart, runLoop } from "../loop.js";
 import { freezesEntryArgsOf } from "../loop-constructors.js";
 import { buildLoopEntry, freshCursor, type LoopDeps, type LoopEntry } from "../loop-kinds.js";
 import { validateUnitDeps } from "../loop-waves.js";
 import {
 	FAIL_LOOP_CAP_HALT,
+	FAIL_VALIDATE_GATE_SKIPPED,
 	FAIL_VERIFY_FAILED,
 	MSG_CONTINUE_FALLBACK,
 	MSG_RESUME_SESSION_FALLBACK,
@@ -40,6 +43,7 @@ import { continueStageSession, locateSessionFile, reattachStageSession, runStage
 import { forkChildSession, reattachChildSession } from "../sessions/spawn.js";
 import type { WorkflowStage } from "../state/index.js";
 import type { RunContext, StageSession, WorkflowHostContext } from "../types.js";
+import { resolveDigest } from "../worktree-digest.js";
 import { advanceChain, type ChainDeps } from "./chain-advance.js";
 import { type ChainOutcome, haltChain, recordAbortedAtSeam, recordEntryThrow, withStageEntryGuard } from "./failure.js";
 import { ensureContractInputValid, ensureInputValid } from "./input-validation.js";
@@ -186,7 +190,7 @@ function buildSingleStageSession(
 		cwd: run.cwd,
 		runId: run.runId,
 		state: run.state,
-		prompt: prep.prompt,
+		prompt: prep.prompt + failureMemoSuffix(run.state),
 		stageName: stage.name,
 		skill: stage.skill,
 		lifecycle: run.lifecycle,
@@ -197,6 +201,8 @@ function buildSingleStageSession(
 		snapshot: prep.snapshot,
 		model: run.resolveModel?.({ stage: stage.name, skill: stage.skill }),
 		signal: run.signal,
+		readSessionBranch: run.readSessionBranch,
+		worktreeDigest: run.worktreeDigest,
 		branchOffset,
 		onFailure: (freshCtx) => notifyPartialArtifacts(freshCtx, run.cwd, run.runId),
 		onSuccess: (freshCtx) => advance(freshCtx, stage.name, idx, run),
@@ -242,6 +248,45 @@ async function runSingleStage(
 	idx: number,
 	run: RunContext,
 ): Promise<ChainOutcome> {
+	// Validation-retry mechanism-2: fail-fast a re-dispatch of a schema-validated produces
+	// stage against an UNCHANGED worktree (no observable fix since the last
+	// validation failure at the same progress point) — WITHOUT dispatching the
+	// session or running preflights. Operator resume is excluded: session-backed
+	// resume never reaches `runSingleStage`, and a cold re-run under
+	// `trigger.meta.resumedFrom` is bypassed by `isOperatorResume`. The terminal
+	// skip carries the failure memo for free through the shared `recordTerminalFailure`
+	// writer (audit.ts:134). An `undefined` digest (non-repo / git missing) ALWAYS
+	// proceeds — degrade on a missing signal, never skip.
+	const isOperatorResume = run.trigger.meta?.resumedFrom !== undefined;
+	const qualifies =
+		stage.def.kind === "produces" &&
+		!!(stage.def.outputSchema || isJsonSchemaObject(run.skillContracts?.get(stage.skill)?.produces?.data));
+	if (!isOperatorResume && qualifies) {
+		const digest = resolveDigest(run.worktreeDigest, run.cwd);
+		const baseline = run.state.lastGatedDispatch;
+		if (
+			baseline &&
+			baseline.stage === stage.name &&
+			digest !== undefined &&
+			digest === baseline.digest &&
+			run.state.stagesCompleted === baseline.stagesCompleted
+		) {
+			await recordTerminalFailure(
+				curCtx,
+				auditCtxFor(run, stage.name, stage.skill),
+				failedArgs(FAIL_VALIDATE_GATE_SKIPPED(stage.skill)),
+			);
+			return "halted";
+		}
+		// Overwrite the baseline on every qualifying dispatch with a defined
+		// digest, so the NEXT dispatch of this stage compares against the most
+		// recent state (the "tree changed" / "fix ran" proceed arms both land
+		// here after the non-matching halt check above).
+		if (digest !== undefined) {
+			run.state.lastGatedDispatch = { stage: stage.name, digest, stagesCompleted: run.state.stagesCompleted };
+		}
+	}
+
 	const prep = await prepareSingleStage(curCtx, stage, idx, run);
 
 	// onStageStart fires after preflight, before the Pi session opens.

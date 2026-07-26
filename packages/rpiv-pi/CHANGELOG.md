@@ -7,6 +7,22 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`BashWatchdog.reset()`.** The per-command bash watchdog gains a `reset()`
+  that clears its `fired` flag and pending timers WITHOUT unsubscribing the
+  live `tool_execution_start` listener — so a resumed turn's new bash call
+  re-arms a fresh per-`toolCallId` timer on the same watchdog handle. Wired onto
+  the workflow-execution host port as `resetToolTimeout` beside the existing
+  `toolTimeout` verdict channel, enabling strike-based recovery in
+  `rpiv-workflow`.
+- **`readSessionBranch` host enablement.** The workflow-execution host exposes
+  a `readSessionBranch(file)` reader backed by `SessionManager.open(file).getBranch()`,
+  narrowed to `BranchEntry[]` and wrapped to fail soft (returns `undefined` on
+  any throw). The death-scene artifact writer consumes it to render a failed
+  stage's last tool calls + final assistant text + session-file path purely from
+  the persisted session JSONL, with no live-session re-query.
+
 ## [2.1.0] - 2026-07-23
 
 ### Changed

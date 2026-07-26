@@ -37,7 +37,15 @@ import type { RunContext, SessionContext, UnitRef } from "./types.js";
  */
 export type AuditCtx = Pick<
 	SessionContext,
-	"cwd" | "runId" | "state" | "stageName" | "skill" | "lifecycle" | "runIdentity" | "allocatedStageNumber"
+	| "cwd"
+	| "runId"
+	| "state"
+	| "stageName"
+	| "skill"
+	| "lifecycle"
+	| "runIdentity"
+	| "allocatedStageNumber"
+	| "readSessionBranch"
 > & {
 	session: SessionRef | null;
 	isScript?: boolean;
