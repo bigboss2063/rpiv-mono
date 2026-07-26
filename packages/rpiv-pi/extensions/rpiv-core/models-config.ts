@@ -35,6 +35,15 @@ export type ThinkingLevelValue = (typeof THINKING_LEVEL_VALUES)[number];
 export const MODEL_THINKING_LEVEL_VALUES = ["off", ...THINKING_LEVEL_VALUES] as const;
 export type ModelThinkingLevelValue = (typeof MODEL_THINKING_LEVEL_VALUES)[number];
 
+/**
+ * Background-lane concurrency cap fallback. The fail-soft default applied by
+ * `resolveMaxConcurrency` when `~/.config/rpiv-pi/models.json` is absent or
+ * carries no valid `maxConcurrency`. Rate limits, not CPU, are the real cap —
+ * 4 background lanes is the safe default. Re-exported from
+ * packages/rpiv-pi/extensions/rpiv-core/workflow-execution-host.ts to preserve the tested public surface.
+ */
+export const DEFAULT_MAX_CONCURRENCY = 4;
+
 // ---------------------------------------------------------------------------
 // TypeBox schemas
 // ---------------------------------------------------------------------------
@@ -121,6 +130,13 @@ const ModelsConfigSchema = Type.Object(
 		stages: Type.Optional(Type.Record(Type.String(), ModelEntrySchema)),
 		skills: Type.Optional(Type.Record(Type.String(), ModelEntrySchema)),
 		presets: Type.Optional(Type.Record(Type.String(), PresetSchema)),
+		maxConcurrency: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				description:
+					"Background-lane concurrency cap (fail-soft default applied by resolveMaxConcurrency when absent/invalid)",
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -145,6 +161,8 @@ export interface ModelsConfig {
 	stages?: Record<string, ResolvedModelConfig>;
 	skills?: Record<string, ResolvedModelConfig>;
 	presets?: Record<string, { stages?: Record<string, ResolvedModelConfig> }>;
+	/** Background-lane concurrency cap. Absent/invalid ⇒ DEFAULT_MAX_CONCURRENCY (via resolveMaxConcurrency). */
+	maxConcurrency?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +255,7 @@ export function loadModelsConfig(): ModelsConfig {
 		stages: Object.keys(stages).length > 0 ? stages : undefined,
 		skills: Object.keys(skills).length > 0 ? skills : undefined,
 		presets: Object.keys(presets).length > 0 ? presets : undefined,
+		maxConcurrency: validated.maxConcurrency,
 	};
 	modelsConfigCache = result;
 	return result;
@@ -316,6 +335,21 @@ export function resolveStageModel(
 		if (perSkill) return perSkill;
 	}
 	return config.defaults;
+}
+
+/**
+ * Resolve the background-lane concurrency cap from `~/.config/rpiv-pi/models.json`.
+ * Returns `DEFAULT_MAX_CONCURRENCY` (4) when the key is absent OR holds an invalid
+ * value (non-integer, < 1).
+ *
+ * NOTE: `Value.Clean` (typebox@1.3.6) does NOT strip invalid scalars — it only
+ * strips unknown keys and coerces `null` → `undefined` — so a configured
+ * `maxConcurrency: 0` / `-1` / `4.5` / `"4"` survives schema validation. This
+ * guard is therefore the fail-soft boundary, not the schema's `minimum: 1`.
+ */
+export function resolveMaxConcurrency(config: ModelsConfig): number {
+	const v = config.maxConcurrency;
+	return v !== undefined && Number.isInteger(v) && v >= 1 ? v : DEFAULT_MAX_CONCURRENCY;
 }
 
 // ---------------------------------------------------------------------------

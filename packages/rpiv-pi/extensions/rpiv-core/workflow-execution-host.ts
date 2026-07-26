@@ -21,7 +21,7 @@ import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { BranchEntry, ModelSelection, WorkflowHostContext } from "@juicesharp/rpiv-workflow";
 import { isLaneRelayUiContext } from "./lane-relay-ui.js";
-import { loadModelsConfig, resolveStageModel } from "./models-config.js";
+import { loadModelsConfig, resolveMaxConcurrency, resolveStageModel } from "./models-config.js";
 import { getFocusedRun, getLane, recordRun, retireRun, setLaneAbort } from "./run-lane-registry.js";
 import { SdkWorkflowHost } from "./sdk-workflow-host.js";
 import { getCapturedModelRegistry, getCapturedUiContext } from "./session-capture.js";
@@ -35,11 +35,12 @@ type WorkflowExecution = {
 };
 
 /**
- * Background-lane concurrency cap. Rate limits, not CPU, are the real cap.
- * 4 is the default; a later step can make it config-driven
- * via the models/workflow config. Declared once, here, at the registration site.
+ * Background-lane concurrency cap, re-exported from models-config.ts (the single
+ * source of truth alongside `resolveMaxConcurrency`). Re-exported here to
+ * preserve the tested public surface; the live cap is driven through
+ * `resolveMaxConcurrency(loadModelsConfig())` at the consumer below.
  */
-export const DEFAULT_MAX_CONCURRENCY = 4;
+export { DEFAULT_MAX_CONCURRENCY } from "./models-config.js";
 
 /**
  * Map the config layer's `ResolvedModelConfig` ({ model?, thinking? }) to the
@@ -96,7 +97,7 @@ export function createWorkflowExecution(
 		cwd: observer.cwd,
 		runId,
 		childSessionsDir, // resolved by the runner; rpiv-pi does not synthesize the path
-		maxConcurrency: DEFAULT_MAX_CONCURRENCY, // 4 — background-lane cap
+		maxConcurrency: resolveMaxConcurrency(loadModelsConfig()), // config-driven background-lane cap (default 4)
 	});
 
 	// Record this run as a switchable lane at launch (appears in the ambient
@@ -180,8 +181,11 @@ export async function registerWorkflowExecutionHostProvider(): Promise<void> {
 			// Death-scene reader — re-open the just-failed session's persisted JSONL
 			// and return its branch, narrowed to the workflow-owned BranchEntry shape
 			// (the SDK's SessionEntry union carries private discriminators — the
-			// `as unknown as` double-cast mirrors transcript.ts `readBranch`, the single
-			// boundary that applies the cast). Fail-soft: any open/read error ⇒ undefined.
+			// `as unknown as` double-cast is duplicated by necessity, not a mirror:
+			// this module sits on the entry graph, so sibling-import-graph.test.ts
+			// forbids a value-import of `readBranch` from the peer
+			// packages/rpiv-workflow/transcript.ts. That twin cast stays untouched —
+			// peer package, out of write scope). Fail-soft: any open/read error ⇒ undefined.
 			readSessionBranch: (file: string) => {
 				try {
 					return SessionManager.open(file).getBranch() as unknown as BranchEntry[] | undefined;

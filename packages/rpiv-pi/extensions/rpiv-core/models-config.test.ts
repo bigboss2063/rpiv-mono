@@ -7,6 +7,7 @@ import {
 	invalidateModelsConfigCache,
 	loadModelsConfig,
 	type ModelsConfig,
+	resolveMaxConcurrency,
 	resolveStageModel,
 } from "./models-config.js";
 
@@ -268,6 +269,12 @@ describe("models-config", () => {
 			);
 			expect(loadModelsConfig().agents!.a).toEqual({ model: "openai/gpt-5.5", thinking: "off" });
 		});
+
+		it("round-trips maxConcurrency into the resolved config (guards the manual result copy)", () => {
+			writeFileSync(configFilePath, JSON.stringify({ maxConcurrency: 8 }), "utf-8");
+			const config = loadModelsConfig();
+			expect(config.maxConcurrency).toBe(8);
+		});
 	});
 
 	describe("loadModelsConfig cache", () => {
@@ -403,6 +410,40 @@ describe("models-config", () => {
 			// Standalone bracket passes only `skill`; preset + stage are undefined.
 			expect(resolveStageModel(config, { skill: "commit" })).toEqual({ model: "zai/glm-4-7" });
 			expect(resolveStageModel(config, { skill: "unknown" })).toEqual({ model: "anthropic/opus" });
+		});
+	});
+
+	describe("resolveMaxConcurrency", () => {
+		it("returns the default (4) when maxConcurrency is absent", () => {
+			expect(resolveMaxConcurrency({})).toBe(4);
+		});
+
+		it("returns the default (4) when maxConcurrency is null", () => {
+			expect(resolveMaxConcurrency({ maxConcurrency: null } as unknown as ModelsConfig)).toBe(4);
+		});
+
+		it("passes through a valid positive integer", () => {
+			expect(resolveMaxConcurrency({ maxConcurrency: 8 })).toBe(8);
+		});
+
+		it("passes through the boundary value 1", () => {
+			expect(resolveMaxConcurrency({ maxConcurrency: 1 })).toBe(1);
+		});
+
+		it("falls back to default for 0 (fails the >= 1 guard)", () => {
+			expect(resolveMaxConcurrency({ maxConcurrency: 0 })).toBe(4);
+		});
+
+		it("falls back to default for negative integers", () => {
+			expect(resolveMaxConcurrency({ maxConcurrency: -1 })).toBe(4);
+		});
+
+		it("falls back to default for non-integer numbers", () => {
+			expect(resolveMaxConcurrency({ maxConcurrency: 4.5 })).toBe(4);
+		});
+
+		it("falls back to default for a numeric string (Value.Clean does not coerce)", () => {
+			expect(resolveMaxConcurrency({ maxConcurrency: "4" } as unknown as ModelsConfig)).toBe(4);
 		});
 	});
 
