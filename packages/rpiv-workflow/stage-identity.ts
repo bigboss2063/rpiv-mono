@@ -1,18 +1,23 @@
 /**
  * Stage-identity derivations — the pure projections off a `StageDef` that the
  * runtime and the load-time validators must agree on (effective skill, publish
- * name, dispatch-vs-body classification).
+ * name, dispatch-vs-body classification, effective output schema).
  *
- * A dependency-free LEAF (imports only `StageDef`/`SkillStage` TYPES): so the
+ * A LEAF on internal edges: it imports only TYPES from `./api.js` and
+ * `./skill-contract.js`, plus VALUE helpers from `./json-schema.js` (which is
+ * itself a leaf — `@standard-schema/spec` + `typebox` only, no internal `./`
+ * imports — so this value edge introduces no cycle). That lets the
  * definition/compile-time context (`load/`, `validate/`, `skill-contracts/harvest`)
- * can consume these without importing `chain-state.ts` — a RUNTIME-STATE module
+ * consume these without importing `chain-state.ts` — a RUNTIME-STATE module
  * (it imports `RunState` and houses `applyCompletedStage(state, …)` mutators).
  * Co-locating these projections there forced a structural edge from the loader +
  * validators into the execution context, enforced by nothing but convention.
  * `chain-state.ts` re-exports them so its own runtime callers keep one import.
  */
 
-import type { SkillStage, StageDef } from "./api.js";
+import type { SkillStage, StageDef, StageSchema } from "./api.js";
+import { isJsonSchemaObject, jsonSchemaToStandard } from "./json-schema.js";
+import type { SkillContractMap } from "./skill-contract.js";
 
 /**
  * Resolve the `state.named` key a produces stage appends its `Output`
@@ -36,6 +41,40 @@ export function resolvePublishName(def: StageDef, stageName: string): string {
  */
 export function resolveSkill(def: StageDef, stageName: string): string {
 	return def.skill ?? stageName;
+}
+
+/**
+ * Resolve the schema a produces stage's output is validated against: the
+ * stage's own `outputSchema` if it declares one (precedence — NOT `??`), else
+ * the dispatched skill's contract `produces.data` (sourced from the
+ * registered-contract registry threaded onto the session / run).
+ *
+ * The SINGLE runtime spelling of this predicate. Both RUNTIME call sites
+ * consume it — `sessions/extraction.ts` (`shouldValidateOutput` +
+ * `retryUntilValid`) and `runner/run-stage.ts` (`gateValidationRedispatch`) — so
+ * the two can no longer drift on the precedence order, the contract key, or the
+ * fail-soft guard. (The load-time twin in
+ * `validate/contract-compat.ts:checkPredicateSchemas` is a separate, stricter
+ * `isDispatchingStage`-guarded policy and stays distinct by design.)
+ *
+ * `resolveSkill(def, stageName)` is the SAME registry key
+ * `validate-workflow.ts` and `harvestStageContracts` key the map by — and the
+ * same key the prior private twin derived indirectly through `s.skill`
+ * (= `resolveSkill` applied once in `resolveStage`).
+ *
+ * Degrades exactly like the input-side runtime mirror: a non-object /
+ * unparseable `produces.data` is treated as absent (no schema), never thrown.
+ * Returns `undefined` when neither source supplies a schema.
+ */
+export function effectiveOutputSchemaOf(
+	def: StageDef,
+	stageName: string,
+	skillContracts: SkillContractMap | undefined,
+): StageSchema | undefined {
+	if (def.outputSchema) return def.outputSchema;
+	const producesData = skillContracts?.get(resolveSkill(def, stageName))?.produces?.data;
+	if (!isJsonSchemaObject(producesData)) return undefined;
+	return jsonSchemaToStandard(producesData);
 }
 
 /**

@@ -1182,6 +1182,33 @@ describe("reconstructState", () => {
 		expect(result.state.output).toStrictEqual(out1);
 		expect(result.visited).toEqual(new Set(["plan", "build"]));
 	});
+
+	it("lastGatedDispatch is TRANSIENT: a completed produces stage folded through reconstructState yields undefined (fresh gate on resume)", async () => {
+		// The validation-redispatch baseline lives ONLY in memory — the resume
+		// fold rebuilds RunState from rows, and no row carries the baseline, so a
+		// resumed run starts with NO prior gate (first qualifying dispatch
+		// proceeds). Matches the `lastGatedDispatch` TRANSIENT contract
+		// (`packages/rpiv-workflow/types.ts:108`) and the `freshRunState` init
+		// (`packages/rpiv-workflow/runner/run-context.ts:66`).
+		const out1 = fakeOutput([fakeArtifact("plans/p1.md")]);
+		writeRunStages([
+			{
+				session: null,
+				stageNumber: 1,
+				stage: "plan",
+				skill: "plan",
+				status: "completed",
+				ts: "t1",
+				output: out1,
+			},
+		]);
+
+		const result = await reconstructState(tmpDir, linearWorkflow, baseHeader);
+
+		expect(result.ok).toBe(true);
+		if (!result.ok) return; // type narrow
+		expect(result.state.lastGatedDispatch).toBeUndefined();
+	});
 });
 
 // ---------------------------------------------------------------------------

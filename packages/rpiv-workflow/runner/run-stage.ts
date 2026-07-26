@@ -26,7 +26,6 @@ import { currentPrimaryArtifact, resolveStagePrompt, stageEntryArgs } from "../c
 import { lifecycleCtxFor, skillStageRef } from "../events.js";
 import { failureMemoSuffix } from "../failure-memos.js";
 import { formatError } from "../internal-utils.js";
-import { isJsonSchemaObject } from "../json-schema.js";
 import { announceLoopStart, runLoop } from "../loop.js";
 import { freezesEntryArgsOf } from "../loop-constructors.js";
 import { buildLoopEntry, freshCursor, type LoopDeps, type LoopEntry } from "../loop-kinds.js";
@@ -41,6 +40,7 @@ import {
 } from "../messages.js";
 import { continueStageSession, locateSessionFile, reattachStageSession, runStageSession } from "../sessions/index.js";
 import { forkChildSession, reattachChildSession } from "../sessions/spawn.js";
+import { effectiveOutputSchemaOf } from "../stage-identity.js";
 import type { WorkflowStage } from "../state/index.js";
 import type { RunContext, StageSession, WorkflowHostContext } from "../types.js";
 import { resolveDigest } from "../worktree-digest.js";
@@ -230,6 +230,63 @@ function announceSingleStageStart(
 }
 
 /**
+ * Validation-retry mechanism-2: fail-fast a re-dispatch of a schema-validated
+ * produces stage against an UNCHANGED worktree (no observable fix since the last
+ * validation failure at the same progress point) — WITHOUT dispatching the
+ * session or running preflights. Returns `true` when the stage is halted (the
+ * caller short-circuits with `return "halted"`); `false` to proceed.
+ *
+ * Operator resume is excluded: session-backed resume never reaches
+ * `runSingleStage`, and a cold re-run under `trigger.meta.resumedFrom` is
+ * bypassed by `isOperatorResume`. The terminal skip carries the failure memo
+ * for free through the shared `recordTerminalFailure` writer
+ * (`packages/rpiv-workflow/audit.ts:122`). An `undefined` digest (non-repo / git
+ * missing) ALWAYS proceeds — degrade on a missing signal, never skip.
+ *
+ * The qualifying predicate — "a produces stage with an effective output schema"
+ * — is the shared `effectiveOutputSchemaOf`
+ * (`packages/rpiv-workflow/stage-identity.ts`): the single RUNTIME spelling also
+ * consumed by the extraction retry loop (`sessions/extraction.ts`), so the gate
+ * and the retry loop agree on what "schema-validated" means and can no longer
+ * drift on the precedence order or the contract key.
+ */
+export async function gateValidationRedispatch(
+	curCtx: WorkflowHostContext,
+	stage: ResolvedStage,
+	run: RunContext,
+): Promise<boolean> {
+	const isOperatorResume = run.trigger.meta?.resumedFrom !== undefined;
+	const qualifies =
+		stage.def.kind === "produces" && !!effectiveOutputSchemaOf(stage.def, stage.name, run.skillContracts);
+	if (!isOperatorResume && qualifies) {
+		const digest = resolveDigest(run.worktreeDigest, run.cwd);
+		const baseline = run.state.lastGatedDispatch;
+		if (
+			baseline &&
+			baseline.stage === stage.name &&
+			digest !== undefined &&
+			digest === baseline.digest &&
+			run.state.stagesCompleted === baseline.stagesCompleted
+		) {
+			await recordTerminalFailure(
+				curCtx,
+				auditCtxFor(run, stage.name, stage.skill),
+				failedArgs(FAIL_VALIDATE_GATE_SKIPPED(stage.skill)),
+			);
+			return true;
+		}
+		// Overwrite the baseline on every qualifying dispatch with a defined
+		// digest, so the NEXT dispatch of this stage compares against the most
+		// recent state (the "tree changed" / "fix ran" proceed arms both land
+		// here after the non-matching halt check above).
+		if (digest !== undefined) {
+			run.state.lastGatedDispatch = { stage: stage.name, digest, stagesCompleted: run.state.stagesCompleted };
+		}
+	}
+	return false;
+}
+
+/**
  * The single-session path (prompt + skill dispatch): preflights → prompt
  * prep → input validation → snapshot → session.
  *
@@ -248,44 +305,11 @@ async function runSingleStage(
 	idx: number,
 	run: RunContext,
 ): Promise<ChainOutcome> {
-	// Validation-retry mechanism-2: fail-fast a re-dispatch of a schema-validated produces
-	// stage against an UNCHANGED worktree (no observable fix since the last
-	// validation failure at the same progress point) — WITHOUT dispatching the
-	// session or running preflights. Operator resume is excluded: session-backed
-	// resume never reaches `runSingleStage`, and a cold re-run under
-	// `trigger.meta.resumedFrom` is bypassed by `isOperatorResume`. The terminal
-	// skip carries the failure memo for free through the shared `recordTerminalFailure`
-	// writer (audit.ts:134). An `undefined` digest (non-repo / git missing) ALWAYS
-	// proceeds — degrade on a missing signal, never skip.
-	const isOperatorResume = run.trigger.meta?.resumedFrom !== undefined;
-	const qualifies =
-		stage.def.kind === "produces" &&
-		!!(stage.def.outputSchema || isJsonSchemaObject(run.skillContracts?.get(stage.skill)?.produces?.data));
-	if (!isOperatorResume && qualifies) {
-		const digest = resolveDigest(run.worktreeDigest, run.cwd);
-		const baseline = run.state.lastGatedDispatch;
-		if (
-			baseline &&
-			baseline.stage === stage.name &&
-			digest !== undefined &&
-			digest === baseline.digest &&
-			run.state.stagesCompleted === baseline.stagesCompleted
-		) {
-			await recordTerminalFailure(
-				curCtx,
-				auditCtxFor(run, stage.name, stage.skill),
-				failedArgs(FAIL_VALIDATE_GATE_SKIPPED(stage.skill)),
-			);
-			return "halted";
-		}
-		// Overwrite the baseline on every qualifying dispatch with a defined
-		// digest, so the NEXT dispatch of this stage compares against the most
-		// recent state (the "tree changed" / "fix ran" proceed arms both land
-		// here after the non-matching halt check above).
-		if (digest !== undefined) {
-			run.state.lastGatedDispatch = { stage: stage.name, digest, stagesCompleted: run.state.stagesCompleted };
-		}
-	}
+	// Validation-retry mechanism-2 lives in `gateValidationRedispatch` (above) —
+	// fail-fast an unchanged-tree re-dispatch of a schema-validated produces
+	// stage BEFORE preflights or the session open. `true` ⇒ already recorded a
+	// terminal failure row; halt here.
+	if (await gateValidationRedispatch(curCtx, stage, run)) return "halted";
 
 	const prep = await prepareSingleStage(curCtx, stage, idx, run);
 

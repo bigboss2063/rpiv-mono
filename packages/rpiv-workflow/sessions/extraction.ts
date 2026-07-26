@@ -20,7 +20,6 @@ import { allocateStageNumber, currentStageRef } from "../audit.js";
 import { lifecycleCtxFromSession } from "../events.js";
 import type { Artifact } from "../handle.js";
 import { assertNever, formatError, nowIso, withTimeout } from "../internal-utils.js";
-import { isJsonSchemaObject, jsonSchemaToStandard } from "../json-schema.js";
 import {
 	ERR_COLLECTOR_THREW,
 	ERR_PARSER_THREW,
@@ -30,6 +29,7 @@ import {
 import { sideEffectOutcome } from "../outcomes/index.js";
 import { finalizeOutput, type Output, outputMeta } from "../output.js";
 import type { CollectCtx, Outcome } from "../output-spec.js";
+import { effectiveOutputSchemaOf } from "../stage-identity.js";
 import { type BranchEntry, readBranch } from "../transcript.js";
 import type { StageSession, WorkflowSessionContext } from "../types.js";
 import {
@@ -223,28 +223,8 @@ function enforceCompletionContract(
 	return { kind: "ok", output };
 }
 
-/**
- * The schema output is validated against: the stage's own `outputSchema` if it
- * declares one, otherwise the dispatched skill's contract `produces.data`
- * (sourced from the registered-contract registry threaded onto the session).
- *
- * Degrades exactly like the input-side runtime mirror (`ensureContractInputValid`):
- * a non-object / unparseable `produces.data` is treated as absent (no schema),
- * never thrown. Returns `undefined` when neither source supplies a schema.
- */
-function effectiveOutputSchema(s: StageSession): StageSchema | undefined {
-	if (s.stage.outputSchema) return s.stage.outputSchema;
-	// `s.skill` is resolved via `resolveSkill(def, stageName)` in `resolveStage`
-	// (run-stage.ts), matching the contract map key used by
-	// `validate-workflow.ts` and `harvestStageContracts`. The single helper
-	// ensures load-time lint and runtime agree on which contract covers the stage.
-	const producesData = s.skillContracts?.get(s.skill)?.produces?.data;
-	if (!isJsonSchemaObject(producesData)) return undefined;
-	return jsonSchemaToStandard(producesData);
-}
-
 function shouldValidateOutput(s: StageSession, output: Output): boolean {
-	return !!(effectiveOutputSchema(s) && output.data !== undefined);
+	return !!(effectiveOutputSchemaOf(s.stage, s.stageName, s.skillContracts) && output.data !== undefined);
 }
 
 interface RetryDeps {
@@ -259,7 +239,7 @@ async function retryUntilValid(
 	deps: RetryDeps,
 	initial: Output,
 ): Promise<OutputProduction> {
-	const schema = effectiveOutputSchema(s)!;
+	const schema = effectiveOutputSchemaOf(s.stage, s.stageName, s.skillContracts)!;
 	const maxRetries = clampRange(
 		s.stage.maxRetries,
 		MIN_VALIDATION_RETRIES,
