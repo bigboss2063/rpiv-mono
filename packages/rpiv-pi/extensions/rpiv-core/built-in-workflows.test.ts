@@ -1664,6 +1664,69 @@ describe("build slice-check (deterministic floor)", () => {
 		expect(data.pass).toBe(true);
 	});
 
+	// Dependency citations — research/design artifacts legitimately cite installed
+	// dependency source (lockfile-pinned, so line numbers are stable). The citation
+	// regex cannot carry `@`, so a cited `node_modules/@scope/pkg/f.js` parses as
+	// `scope/pkg/f.js`; the checker probes `node_modules/<path>` and
+	// `node_modules/@<path>` before the suffix fallback.
+	it("resolves a scoped-dependency citation cited without the @/node_modules prefix", () => {
+		mkdirSync(join(tmpDir, "node_modules/@some-scope/pkg/dist"), { recursive: true });
+		writeFileSync(
+			join(tmpDir, "node_modules/@some-scope/pkg/dist/mod.js"),
+			Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n"),
+		);
+		const rel = ".rpiv/artifacts/slices/cite-dep-scoped.md";
+		const m = write(
+			rel,
+			`---\nstatus: ready\nslice_count: 1\nslices:\n  - { n: 1, title: A, deps: [] }\n---\n## Slice 1: A\n**Draws on:** some-scope/pkg/dist/mod.js:20\n`,
+		);
+		const data = runOn(m);
+		expect(data.pass).toBe(true);
+	});
+
+	it("resolves a full node_modules/@scope citation (regex drops the node_modules/@ prefix)", () => {
+		mkdirSync(join(tmpDir, "node_modules/@some-scope/pkg/dist"), { recursive: true });
+		writeFileSync(
+			join(tmpDir, "node_modules/@some-scope/pkg/dist/mod.js"),
+			Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n"),
+		);
+		const rel = ".rpiv/artifacts/slices/cite-dep-full.md";
+		const m = write(
+			rel,
+			`---\nstatus: ready\nslice_count: 1\nslices:\n  - { n: 1, title: A, deps: [] }\n---\n## Slice 1: A\n**Draws on:** node_modules/@some-scope/pkg/dist/mod.js:20\n`,
+		);
+		const data = runOn(m);
+		expect(data.pass).toBe(true);
+	});
+
+	it("resolves an unscoped-dependency citation cited without the node_modules prefix", () => {
+		mkdirSync(join(tmpDir, "node_modules/plainpkg"), { recursive: true });
+		writeFileSync(
+			join(tmpDir, "node_modules/plainpkg/index.js"),
+			Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n"),
+		);
+		const rel = ".rpiv/artifacts/slices/cite-dep-plain.md";
+		const m = write(
+			rel,
+			`---\nstatus: ready\nslice_count: 1\nslices:\n  - { n: 1, title: A, deps: [] }\n---\n## Slice 1: A\n**Draws on:** plainpkg/index.js:5\n`,
+		);
+		const data = runOn(m);
+		expect(data.pass).toBe(true);
+	});
+
+	it("still flags a dependency citation past end-of-file after resolving it", () => {
+		mkdirSync(join(tmpDir, "node_modules/@some-scope/pkg/dist"), { recursive: true });
+		writeFileSync(join(tmpDir, "node_modules/@some-scope/pkg/dist/mod.js"), "a\nb\nc\n");
+		const rel = ".rpiv/artifacts/slices/cite-dep-eof.md";
+		const m = write(
+			rel,
+			`---\nstatus: ready\nslice_count: 1\nslices:\n  - { n: 1, title: A, deps: [] }\n---\n## Slice 1: A\n**Draws on:** some-scope/pkg/dist/mod.js:900\n`,
+		);
+		const data = runOn(m);
+		expect(data.pass).toBe(false);
+		expect(String(data.feedback)).toMatch(/matches no version of the file/);
+	});
+
 	// P1 — a bare basename (a path-prefix omission the producers routinely emit,
 	// e.g. `built-in-workflows.ts:1431` for a file nested many dirs deep) resolves
 	// to the ONE tree file with that name, rather than failing the floor on a

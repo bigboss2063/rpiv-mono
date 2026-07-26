@@ -9,6 +9,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Dependency citations resolve in the cite checks.** `file:line` citations
+  into installed dependency source (lockfile-pinned) now verify: the checker
+  probes `node_modules/<path>` and `node_modules/@<path>` before failing a
+  citation, so research/design/plan artifacts citing host-package internals
+  (e.g. `node_modules/@earendil-works/pi-coding-agent/dist/...`) no longer
+  trip the deterministic floor as unbacked. The suffix-fallback walk still
+  never resolves a bare basename into `node_modules`.
 - **`BashWatchdog.reset()`.** The per-command bash watchdog gains a `reset()`
   that clears its `fired` flag and pending timers WITHOUT unsubscribing the
   live `tool_execution_start` listener — so a resumed turn's new bash call

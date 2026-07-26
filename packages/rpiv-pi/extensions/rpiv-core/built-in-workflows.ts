@@ -1006,6 +1006,20 @@ const verifyCitations = (body: string, cwd: string): { detail: string; where: st
 		if (existsSync(direct) && statSync(direct).isFile()) {
 			abs = direct;
 		} else {
+			// Dependency citations: research/design artifacts legitimately cite installed
+			// dependency source (lockfile-pinned, so line numbers are stable). Probe
+			// `node_modules/<path>` and `node_modules/@<path>` — the latter because the
+			// citation regex cannot carry `@`, so a cited `node_modules/@scope/pkg/f.js`
+			// parses as `scope/pkg/f.js`. DIRECT probes only: the suffix-fallback walk
+			// still skips node_modules, so a bare basename never resolves into a dep.
+			for (const candidate of [join(cwd, "node_modules", path), join(cwd, "node_modules", `@${path}`)]) {
+				if (existsSync(candidate) && statSync(candidate).isFile()) {
+					abs = candidate;
+					break;
+				}
+			}
+		}
+		if (!abs) {
 			// Suffix fallback: back the citation iff exactly ONE tree file matches.
 			const matches = suffixMatches(path);
 			if (matches.length === 1) {
@@ -1021,7 +1035,7 @@ const verifyCitations = (body: string, cwd: string): { detail: string; where: st
 		}
 		if (!abs) {
 			findings.push({
-				detail: `Unbacked citation ${key} — the cited file does not exist at this revision. A file:line citation must resolve, or the line numbers must be omitted. Fix the path (repo-root-relative) or drop the citation.`,
+				detail: `Unbacked citation ${key} — the cited file does not exist at this revision. A file:line citation must resolve, or the line numbers must be omitted. Fix the path (repo-root-relative, or node_modules/<pkg>/… for an installed dependency file) or drop the citation.`,
 				where: key,
 			});
 			continue;
