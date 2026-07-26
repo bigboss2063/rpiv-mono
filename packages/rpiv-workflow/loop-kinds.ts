@@ -508,6 +508,7 @@ export function buildUnitSession(
 		model: run.resolveModel?.({ stage: e.name, skill: u.skill }),
 		signal,
 		readSessionBranch: run.readSessionBranch,
+		worktreeDigest: run.worktreeDigest,
 		collectAll: shouldCollectAll(e.loop),
 		laneUnitIndex: laneIndexFor(e.loop, index),
 		onFailure: undefined,

@@ -157,10 +157,14 @@ export function formatDeathScene(scene: DeathScene): string {
 		lines.push("_(none)_");
 	} else {
 		for (const call of scene.toolCalls) {
+			// Fence one backtick longer than the longest backtick run in the args, so
+			// a ``` inside a tool arg cannot break out of its fenced block.
+			const longestRun = call.args.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
+			const fence = "`".repeat(Math.max(3, longestRun + 1));
 			lines.push(`- \`${call.name}\``);
-			lines.push("  ```");
+			lines.push(`  ${fence}`);
 			lines.push(`  ${call.args}`);
-			lines.push("  ```");
+			lines.push(`  ${fence}`);
 		}
 	}
 	lines.push("");

@@ -32,6 +32,21 @@ import { createHash } from "node:crypto";
 import { type Dirent, readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
+/** Wall-clock ceiling per git subprocess. The digest runs SYNCHRONOUSLY on the
+ *  validation-retry critical path and the bash watchdog cannot cover it (not a
+ *  tool call, and `execFileSync` blocks the event loop) — so a wedged git (e.g.
+ *  a contended `index.lock` from a concurrent commit) must be killed here. On
+ *  expiry `execFileSync` throws → the digest degrades to `undefined` → both
+ *  gates proceed, the documented missing-signal behavior. */
+const GIT_DIGEST_TIMEOUT_MS = 10_000;
+
+/** Subtree of `.rpiv/artifacts/` excluded from the digest: death-scene sidecars
+ *  are FORENSIC output of failures, not a fix an agent applied. In a concurrent
+ *  collect-all fanout a sibling unit's failure writes here mid-window; hashing
+ *  it would flip another unit's unchanged-digest verdict and defeat the
+ *  fail-fast gate with a spurious "tree changed". */
+const DIGEST_EXCLUDED_ARTIFACT_DIRS: ReadonlySet<string> = new Set(["failures"]);
+
 /**
  * Walk `<cwd>/.rpiv/artifacts/` recursively, hashing each file's relative
  * path + contents so a revision to ANY artifact (incl. a gitignored-only one)
@@ -43,7 +58,7 @@ import { join, relative } from "node:path";
  */
 function hashArtifactsTree(cwd: string): string {
 	const artifactsRoot = join(cwd, ".rpiv", "artifacts");
-	const entries = readdirRecursively(artifactsRoot);
+	const entries = readdirRecursively(artifactsRoot, DIGEST_EXCLUDED_ARTIFACT_DIRS);
 	const hash = createHash("sha256");
 	for (const abs of entries.sort()) {
 		hash.update(relative(artifactsRoot, abs));
@@ -58,10 +73,12 @@ function hashArtifactsTree(cwd: string): string {
 	return hash.digest("hex");
 }
 
-/** Recursive `readdir` returning absolute file paths under `root` (symlinks not followed). */
-function readdirRecursively(root: string): string[] {
+/** Recursive `readdir` returning absolute file paths under `root` (symlinks not
+ *  followed). `excludedTopDirs` names TOP-LEVEL subdirectories of `root` that are
+ *  skipped entirely (deeper same-named dirs are not affected). */
+function readdirRecursively(root: string, excludedTopDirs?: ReadonlySet<string>): string[] {
 	const out: string[] = [];
-	const walk = (dir: string): void => {
+	const walk = (dir: string, isRoot: boolean): void => {
 		let entries: Dirent[];
 		try {
 			entries = readdirSync(dir, { withFileTypes: true });
@@ -70,11 +87,13 @@ function readdirRecursively(root: string): string[] {
 		}
 		for (const entry of entries) {
 			const abs = join(dir, entry.name);
-			if (entry.isDirectory()) walk(abs);
-			else out.push(abs); // files + symlinks (target read fail-soft, below)
+			if (entry.isDirectory()) {
+				if (isRoot && excludedTopDirs?.has(entry.name)) continue;
+				walk(abs, false);
+			} else out.push(abs); // files + symlinks (target read fail-soft, below)
 		}
 	};
-	walk(root);
+	walk(root, true);
 	return out;
 }
 
@@ -94,6 +113,7 @@ export function computeWorktreeDigest(cwd: string): string | undefined {
 			cwd,
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],
+			timeout: GIT_DIGEST_TIMEOUT_MS,
 		});
 		// `diff HEAD` (not bare `diff`) so STAGED content changes the digest too — a fix
 		// that edits-and-stages leaves the porcelain status line and the unstaged diff
@@ -103,6 +123,7 @@ export function computeWorktreeDigest(cwd: string): string | undefined {
 			cwd,
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],
+			timeout: GIT_DIGEST_TIMEOUT_MS,
 		});
 		const artifacts = hashArtifactsTree(cwd);
 		return createHash("sha256").update(status).update("\0").update(diff).update("\0").update(artifacts).digest("hex");

@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Worktree digest hardened after review: each git subprocess is bounded by a
+  10s timeout (a wedged `git status`/`diff` degrades the digest to `undefined`
+  → gates proceed, instead of hanging the runner), `.rpiv/artifacts/failures/`
+  is excluded from the artifacts hash (a sibling unit's forensic death-scene
+  sidecar no longer flips another unit's unchanged-digest verdict during a
+  concurrent fanout), a per-session `worktreeDigest` override now wins even
+  when it returns `undefined`, and loop units thread the override like single
+  stages do. Death-scene tool-call blocks fence with a delimiter longer than
+  any backtick run in the args so tool input cannot break the Markdown fence.
+
 ### Added
 
 - **Strike-based bash recovery.** A per-command bash watchdog tool-timeout is

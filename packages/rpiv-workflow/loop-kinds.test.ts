@@ -136,6 +136,21 @@ describe("buildUnitSession — collectAll is fanout-only (F1 regression)", () =>
 		expect(collectAllFor({ kind: "fanout", failFast: true } as unknown as LoopDef)).toBe(false);
 	});
 
+	it("threads the run's worktreeDigest override onto the unit session (parity with single stages)", () => {
+		const digest = (): string => "fixed-digest";
+		const run = { ...runFull, worktreeDigest: digest } as unknown as RunContext;
+		const s = buildUnitSession(
+			entryWith({ kind: "fanout" } as unknown as LoopDef),
+			unit(),
+			0,
+			run,
+			undefined,
+			undefined,
+			async () => {},
+		);
+		expect(s.worktreeDigest).toBe(digest);
+	});
+
 	it("iterate units NEVER collect all (they advance the cursor)", () => {
 		expect(collectAllFor({ kind: "iterate" } as unknown as LoopDef)).toBe(false);
 	});
