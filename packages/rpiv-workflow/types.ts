@@ -550,22 +550,13 @@ export interface StageSession extends SessionContext {
 	 * Per-activation bash-overrun strike-ceiling override (testability) —
 	 * `undefined` ⇒ the `BASH_TIMEOUT_STRIKES` module default. Pin to `0` in a
 	 * watchdog-contract test to force immediate exhaustion; pin to `N` to drive
-	 * a multi-strike recovery without mutating env.
+	 * a multi-strike recovery without mutating env. Now the SOLE strike surface
+	 * on `StageSession`: the mutable accounting (used counter + reasons
+	 * accumulator) lives in the private `StrikeBudget` value object held in
+	 * `sessions/bash-strikes.ts`, keyed off this session (read once at first
+	 * consume to resolve the budget's ceiling). Immutable per-activation.
 	 */
 	bashTimeoutStrikes?: number;
-	/**
-	 * Internal mutable strike counter for this activation — incremented by each
-	 * consumed bash overrun during `postStage`'s tail-recursive recovery.
-	 * `undefined` ⇒ 0; fresh on every continue/reattach (a new StageSession).
-	 */
-	bashTimeoutStrikesUsed?: number;
-	/**
-	 * Internal mutable accumulator of each consumed strike's host reason —
-	 * appended during recovery so the completed row can record the history.
-	 * `undefined` ⇒ `[]`. Lives on the session solely because it must
-	 * persist across the tail-recursive `postStage`.
-	 */
-	bashTimeoutStrikeReasons?: string[];
 	/**
 	 * Present iff this session IS one loop unit. Pre-decorated at session
 	 * construction by the driver (`stageName` carries the DISPLAY decoration;

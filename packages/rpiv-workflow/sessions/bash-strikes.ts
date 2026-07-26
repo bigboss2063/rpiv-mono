@@ -15,10 +15,11 @@
  * for the resolve-once-at-module-load pattern.
  *
  * Strike-history observability is satisfied here: each consumed strike appends its
- * reason to `s.bashTimeoutStrikeReasons`, and `bashTimeoutStrikeHistory(s)`
- * surfaces `{ count; reasons }` (or `undefined` at zero strikes) for the
- * completed `WorkflowStage` row to carry — an ADDITIVE optional field, NOT a
- * new row kind (the resume fold's shape-filtered readers ignore it, like errMsg).
+ * reason to the per-session `StrikeBudget` (a module-level WeakMap keyed off
+ * session identity), and `bashTimeoutStrikeHistory(s)` surfaces
+ * `{ count; reasons }` (or `undefined` at zero strikes) for the completed
+ * `WorkflowStage` row to carry — an ADDITIVE optional field, NOT a new row kind
+ * (the resume fold's shape-filtered readers ignore it, like errMsg).
  */
 
 import type { StageSession } from "../types.js";
@@ -33,7 +34,8 @@ const MAX_BASH_TIMEOUT_STRIKES = 5; // hard cap on in-place retries before a run
  * override falls back to the default. Strikes are a COUNT, so the parsed value is
  * truncated to an integer before clamping. Resolved once at module load (env is
  * fixed for a process); tests pin an explicit `s.bashTimeoutStrikes` override
- * instead of mutating env.
+ * instead of mutating env. This is the first `process.env` read in rpiv-workflow
+ * production (see the module header above + L3.4-04).
  */
 export const BASH_TIMEOUT_STRIKES = resolveBashTimeoutStrikes(process.env.RPIV_BASH_TIMEOUT_STRIKES);
 
@@ -81,47 +83,100 @@ export function bashTimeoutSteeringMessage(reason: string, strikesRemaining: num
 	return lines.join("\n\n");
 }
 
-// --- Per-session strike accounting (mutable fields on StageSession) ---
+// --- Per-session strike accounting (private StrikeBudget, keyed off session identity) ---
 
-/** The effective ceiling for this activation: the session override, else the module default. */
-function bashStrikeCeiling(s: StageSession): number {
-	return s.bashTimeoutStrikes ?? BASH_TIMEOUT_STRIKES;
+/**
+ * Private per-activation strike budget: the mutable accounting (used counter +
+ * reasons accumulator) that previously lived as two fields on `StageSession`.
+ * Held in a module-level `WeakMap<StageSession, StrikeBudget>` so the budget
+ * survives `postStage`'s tail-recursive recovery self-call
+ * (packages/rpiv-workflow/sessions/sessions.ts:134 — same `s` ⇒ same entry ⇒ the
+ * incremented counter is visible on the recursive turn) and is fresh on every
+ * new `StageSession` for free (no entry ⇒ zero strikes). `ceiling` is resolved
+ * ONCE at first consume from the immutable `s.bashTimeoutStrikes ?? BASH_TIMEOUT_STRIKES`
+ * override and frozen into the budget.
+ */
+interface StrikeBudget {
+	readonly ceiling: number;
+	used: number;
+	reasons: string[];
+}
+
+// `let` (not `const`): `__resetStrikeBudgets()` reassigns this to a fresh map —
+// `WeakMap` exposes no `.clear()`. Keyed by session identity (see StrikeBudget above).
+let strikeBudgets: WeakMap<StageSession, StrikeBudget> = new WeakMap();
+
+/**
+ * The ONLY creator of a `StrikeBudget`: lazily allocated on the first consume,
+ * capturing the ceiling once from the immutable per-activation override.
+ * `bashStrikesRemaining` and `bashTimeoutStrikeHistory` use a non-creating
+ * `.get()` so a clean completion (no consume) allocates nothing — important
+ * because `bashTimeoutStrikeHistory` runs on every successful stage inside
+ * `recordStageSuccess` (packages/rpiv-workflow/sessions/success-persist.ts:49).
+ */
+function budgetForConsume(s: StageSession): StrikeBudget {
+	let b = strikeBudgets.get(s);
+	if (!b) {
+		b = { ceiling: s.bashTimeoutStrikes ?? BASH_TIMEOUT_STRIKES, used: 0, reasons: [] };
+		strikeBudgets.set(s, b);
+	}
+	return b;
 }
 
 /**
- * Consume one strike if any remain: increment `s.bashTimeoutStrikesUsed` and
- * append `reason` to `s.bashTimeoutStrikeReasons`, then return `true`. Returns
- * `false` (mutating nothing) when the ceiling is exhausted — the caller then
- * takes the unchanged soft-halt/terminal seam. Consumes-then-increments: with a
- * default-2 ceiling, strikes 1 and 2 recover; strike 3 returns false.
+ * Consume one strike if any remain: increment the budget's `used` and append
+ * `reason` to `reasons`, then return `true`. Returns `false` (mutating nothing)
+ * when the ceiling is exhausted — the caller then takes the unchanged
+ * soft-halt/terminal seam (packages/rpiv-workflow/sessions/sessions.ts:136).
+ * Consumes-then-increments: with a default-2 ceiling, strikes 1 and 2 recover;
+ * strike 3 returns false. Behavior byte-identical to the pre-encapsulation
+ * field-on-session implementation; the `reasons` lazy-init collapses to a plain
+ * `push` (the budget initializes `reasons: []`).
  */
 export function consumeBashStrike(s: StageSession, reason: string): boolean {
-	const ceiling = bashStrikeCeiling(s);
-	const used = s.bashTimeoutStrikesUsed ?? 0;
-	if (used >= ceiling) return false; // exhausted — mutate nothing; caller escalates.
-	s.bashTimeoutStrikesUsed = used + 1;
-	if (!s.bashTimeoutStrikeReasons) s.bashTimeoutStrikeReasons = [];
-	s.bashTimeoutStrikeReasons.push(reason);
+	const b = budgetForConsume(s);
+	if (b.used >= b.ceiling) return false; // exhausted — mutate nothing; caller escalates.
+	b.used += 1;
+	b.reasons.push(reason);
 	return true;
 }
 
 /**
  * Strikes remaining AFTER the current consumption (0 on the final-strike resume).
- * Computed from the post-increment counter, so it pairs with `consumeBashStrike`
- * having just run.
+ * Computed from the budget's post-increment counter, so it pairs with
+ * `consumeBashStrike` having just run. NON-CREATING `.get()`: a session that
+ * never consumed (or has no budget yet) reads its ceiling from the immutable
+ * override (the former `bashStrikeCeiling` helper's job — removed — moved into
+ * the budget's `ceiling` field + this fallback), allocating nothing.
  */
 export function bashStrikesRemaining(s: StageSession): number {
-	return Math.max(0, bashStrikeCeiling(s) - (s.bashTimeoutStrikesUsed ?? 0));
+	const b = strikeBudgets.get(s);
+	const ceiling = b?.ceiling ?? s.bashTimeoutStrikes ?? BASH_TIMEOUT_STRIKES;
+	return Math.max(0, ceiling - (b?.used ?? 0));
 }
 
 /**
  * The strike history for the completed `WorkflowStage` row —
  * `{ count; reasons }` when the session consumed ≥1 strike, else `undefined`
  * (so a clean completion omits the field and the row is byte-identical to today).
+ * NON-CREATING `.get()`: "no entry" ≡ "zero strikes" ≡ `undefined` holds by
+ * construction (invariant 2's 1st layer), not just by the `used <= 0` guard.
  * `reasons` lists each consumed strike's host reason, in consumption order.
  */
 export function bashTimeoutStrikeHistory(s: StageSession): { count: number; reasons: string[] } | undefined {
-	const count = s.bashTimeoutStrikesUsed ?? 0;
-	if (count <= 0) return undefined;
-	return { count, reasons: s.bashTimeoutStrikeReasons ?? [] };
+	const b = strikeBudgets.get(s);
+	if (!b || b.used <= 0) return undefined;
+	return { count: b.used, reasons: b.reasons };
+}
+
+/**
+ * Test-only: reset the module-level `strikeBudgets` WeakMap to a fresh instance.
+ * The displaced map becomes unreachable and is GC'd with its entries. Re-exported
+ * via `./internal.js` and invoked from `test/setup.ts` `beforeEach` (the
+ * module-level-singleton contract; the identity-keyed map cannot leak across
+ * tests in practice, but the reset makes the fresh-on-resume guarantee
+ * deterministic in the regression test).
+ */
+export function __resetStrikeBudgets(): void {
+	strikeBudgets = new WeakMap();
 }

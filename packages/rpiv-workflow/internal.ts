@@ -35,6 +35,7 @@ export { __resetBuiltIns, flushBuiltInProviders, getBuiltIns } from "./built-ins
 export { __resetLifecycleRegistry } from "./events.js";
 export { __resetWorkflowExecutionHost } from "./execution-host.js";
 export { __resetLoadCache } from "./load/cache.js";
+export { __resetStrikeBudgets } from "./sessions/bash-strikes.js";
 export {
 	__resetSkillContracts,
 	buildEffectiveContracts,

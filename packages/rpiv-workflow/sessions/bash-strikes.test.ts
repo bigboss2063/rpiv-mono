@@ -15,8 +15,7 @@ import {
 } from "./bash-strikes.js";
 
 /** A bare StageSession carrying only the strike-accounting surface the helpers touch. */
-const strikeSession = (overrides: Partial<StageSession> = {}): StageSession =>
-	({ bashTimeoutStrikesUsed: 0, bashTimeoutStrikeReasons: [], ...overrides }) as StageSession;
+const strikeSession = (overrides: Partial<StageSession> = {}): StageSession => ({ ...overrides }) as StageSession;
 
 describe("resolveBashTimeoutStrikes", () => {
 	it("defaults to 2 when the override is absent or non-numeric or non-positive", () => {
@@ -78,11 +77,9 @@ describe("strike accounting", () => {
 	it("consumeBashStrike consumes-then-increments AND appends the reason", () => {
 		const s = strikeSession({ bashTimeoutStrikes: 2 });
 		expect(consumeBashStrike(s, "r1")).toBe(true);
-		expect(s.bashTimeoutStrikesUsed).toBe(1);
-		expect(s.bashTimeoutStrikeReasons).toEqual(["r1"]);
+		expect(bashTimeoutStrikeHistory(s)).toEqual({ count: 1, reasons: ["r1"] });
 		expect(consumeBashStrike(s, "r2")).toBe(true);
-		expect(s.bashTimeoutStrikesUsed).toBe(2);
-		expect(s.bashTimeoutStrikeReasons).toEqual(["r1", "r2"]);
+		expect(bashTimeoutStrikeHistory(s)).toEqual({ count: 2, reasons: ["r1", "r2"] });
 	});
 
 	it("returns false (mutating nothing) once exhausted — counting boundary at default-2", () => {
@@ -90,8 +87,8 @@ describe("strike accounting", () => {
 		consumeBashStrike(s, "r1");
 		consumeBashStrike(s, "r2");
 		expect(consumeBashStrike(s, "r3")).toBe(false); // strike 3 → exhaust
-		expect(s.bashTimeoutStrikesUsed).toBe(2); // unchanged
-		expect(s.bashTimeoutStrikeReasons).toEqual(["r1", "r2"]); // unchanged
+		// unchanged — the two prior consumes stand; the third mutated nothing
+		expect(bashTimeoutStrikeHistory(s)).toEqual({ count: 2, reasons: ["r1", "r2"] });
 	});
 
 	it("bashStrikesRemaining is 0 on the final-strike resume", () => {
@@ -115,5 +112,22 @@ describe("strike accounting", () => {
 		consumeBashStrike(s, "r1");
 		consumeBashStrike(s, "r2");
 		expect(bashTimeoutStrikeHistory(s)).toEqual({ count: 2, reasons: ["r1", "r2"] });
+	});
+
+	it("🔴 resume-fold: a fresh StageSession (same override) starts at zero strikes after a prior session exhausted its budget (no WeakMap stranding)", () => {
+		// A prior session exhausts its 2-strike budget.
+		const prior = strikeSession({ bashTimeoutStrikes: 2 });
+		consumeBashStrike(prior, "r1");
+		consumeBashStrike(prior, "r2");
+		expect(bashStrikesRemaining(prior)).toBe(0);
+		expect(bashTimeoutStrikeHistory(prior)).toEqual({ count: 2, reasons: ["r1", "r2"] });
+
+		// A FRESH StageSession (simulating a resumed activation) with the same override
+		// must start at zero strikes — the WeakMap is keyed by identity, so the prior
+		// session's exhausted budget does NOT strand into the new one. This is the
+		// resume-fold safety net (precedent d753e3b5→4bd1979e/72d47cfb).
+		const freshS = strikeSession({ bashTimeoutStrikes: 2 });
+		expect(bashStrikesRemaining(freshS)).toBe(2);
+		expect(bashTimeoutStrikeHistory(freshS)).toBeUndefined();
 	});
 });
