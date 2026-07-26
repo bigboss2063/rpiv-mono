@@ -922,6 +922,12 @@ const CITATION_WALK_SKIP: ReadonlySet<string> = new Set(["node_modules", ".git",
 /** Backstop so a pathological tree can't stall the deterministic cite floor. */
 const CITATION_WALK_FILE_CAP = 50_000;
 
+/** The lazily-built basename → absolute-path(s) index backing the suffix
+ *  fallback in `resolveCitationPath`. `truncated` marks a partial walk past
+ *  `CITATION_WALK_FILE_CAP`, which disables the fallback (uniqueness
+ *  untrustworthy). */
+type BasenameIndex = { index: Map<string, string[]>; truncated: boolean };
+
 /**
  * Index every source file's basename → its absolute path(s) under `cwd` — the
  * candidate pool behind the suffix fallback in `verifyCitations`. The generative
@@ -935,7 +941,7 @@ const CITATION_WALK_FILE_CAP = 50_000;
  * vendored/generated trees so a citation never resolves to a build copy or a
  * prior artifact. Bounded by the file cap.
  */
-const buildBasenameIndex = (cwd: string): { index: Map<string, string[]>; truncated: boolean } => {
+const buildBasenameIndex = (cwd: string): BasenameIndex => {
 	// Unreadable dir → empty listing, never a throw from the deterministic floor.
 	const listDir = (dir: string) => {
 		try {
@@ -969,70 +975,95 @@ const buildBasenameIndex = (cwd: string): { index: Map<string, string[]>; trunca
 	return { index, truncated: false };
 };
 
+/** Outcome of resolving a single citation's `path` against `cwd`. `abs` is the
+ *  one backing file when resolution is unique; `ambiguous` carries the candidate
+ *  list (absolute paths) when more than one tree file matches, so the caller can
+ *  render the disambiguation finding text. `undefined` ⇒ no match
+ *  (does-not-exist). This is the minimal-deviation return shape — a plain
+ *  `string | undefined` would drop the candidate list the disambiguation finding
+ *  text depends on. */
+type CitationResolution = { abs: string } | { ambiguous: string[] };
+
+/** Strategy 4 of `resolveCitationPath`: tree files whose REPO-RELATIVE path ends
+ *  with the cited `path` on WHOLE segments. A bare basename is the one-segment
+ *  case; a multi-segment citation narrows the basename's candidates at a `/`
+ *  boundary, so `workflow/validate/x.ts` can never match inside
+ *  `rpiv-workflow/validate/x.ts`. Compared repo-relative (never against the
+ *  absolute path) so the checkout directory's own name can never back a citation
+ *  — `src/utils.ts` must not resolve to `<cwd>/utils.ts` just because the repo
+ *  happens to be cloned at `/tmp/src`. Reads/writes the shared `indexHolder` so
+ *  the basename index is built lazily ONCE and shared across citations (the
+ *  first direct-resolution miss pays the tree walk). */
+const suffixMatchesFor = (path: string, cwd: string, indexHolder: { value: BasenameIndex | undefined }): string[] => {
+	indexHolder.value ??= buildBasenameIndex(cwd);
+	if (indexHolder.value.truncated) return []; // partial index ⇒ uniqueness untrustworthy ⇒ strict
+	const candidates = indexHolder.value.index.get(basename(path)) ?? [];
+	if (!path.includes("/")) return candidates;
+	const suffix = `/${path}`;
+	return candidates.filter((abs) =>
+		`/${abs
+			.slice(cwd.length + 1)
+			.split(sep)
+			.join("/")}`.endsWith(suffix),
+	);
+};
+
+/** Resolve a citation's `path` to one backing file under `cwd`, encapsulating
+ *  all four strategies in order: (1) direct — `path` or `cwd/path`; (2,3)
+ *  dependency probes — `node_modules/<path>` and `node_modules/@<path>` (the
+ *  latter because the citation regex cannot carry `@`, so a cited
+ *  `node_modules/@scope/pkg/f.js` parses as `scope/pkg/f.js`); DIRECT probes
+ *  only — the suffix walk still skips `node_modules` (per `CITATION_WALK_SKIP`),
+ *  so a bare basename never resolves into a dep; (4) suffix fallback — a UNIQUE
+ *  tree-file suffix match backs the citation, an AMBIGUOUS one returns the
+ *  candidate list. PURE: emits no findings and throws never — all finding text
+ *  lives in `verifyCitations`. The lazily-built basename index is shared across
+ *  calls via `indexHolder`. */
+const resolveCitationPath = (
+	path: string,
+	cwd: string,
+	indexHolder: { value: BasenameIndex | undefined },
+): CitationResolution | undefined => {
+	// Strategy 1 — direct.
+	const direct = isAbsolute(path) ? path : join(cwd, path);
+	if (existsSync(direct) && statSync(direct).isFile()) return { abs: direct };
+	// Strategies 2 & 3 — dependency probes (lockfile-pinned dep source; the regex
+	// cannot carry `@`, so `node_modules/@scope/pkg/f.js` is cited as `scope/pkg/f.js`).
+	for (const candidate of [join(cwd, "node_modules", path), join(cwd, "node_modules", `@${path}`)]) {
+		if (existsSync(candidate) && statSync(candidate).isFile()) return { abs: candidate };
+	}
+	// Strategy 4 — suffix fallback: back the citation iff exactly ONE tree file matches.
+	const matches = suffixMatchesFor(path, cwd, indexHolder);
+	if (matches.length === 1) return { abs: matches[0] };
+	if (matches.length > 1) return { ambiguous: matches };
+	return undefined;
+};
+
 const verifyCitations = (body: string, cwd: string): { detail: string; where: string }[] => {
 	const findings: { detail: string; where: string }[] = [];
 	const seen = new Set<string>();
 	// Built lazily and reused across citations — only the first direct-resolution
 	// miss pays the tree walk, and only when at least one such citation exists.
-	let basenameIndex: { index: Map<string, string[]>; truncated: boolean } | undefined;
-	// Tree files whose REPO-RELATIVE path ends with the cited path on WHOLE
-	// segments. A bare basename is the one-segment case; a multi-segment citation
-	// narrows the basename's candidates at a `/` boundary, so `workflow/validate/x.ts`
-	// can never match inside `rpiv-workflow/validate/x.ts`. Compared repo-relative
-	// (never against the absolute path) so the checkout directory's own name can
-	// never back a citation — `src/utils.ts` must not resolve to `<cwd>/utils.ts`
-	// just because the repo happens to be cloned at `/tmp/src`.
-	const suffixMatches = (path: string): string[] => {
-		basenameIndex ??= buildBasenameIndex(cwd);
-		if (basenameIndex.truncated) return []; // partial index ⇒ uniqueness untrustworthy ⇒ strict
-		const candidates = basenameIndex.index.get(basename(path)) ?? [];
-		if (!path.includes("/")) return candidates;
-		const suffix = `/${path}`;
-		return candidates.filter((abs) =>
-			`/${abs
-				.slice(cwd.length + 1)
-				.split(sep)
-				.join("/")}`.endsWith(suffix),
-		);
-	};
+	const indexHolder: { value: BasenameIndex | undefined } = { value: undefined };
 	for (const m of body.matchAll(FILE_LINE_CITATION_RE)) {
 		const [, path, startStr, endStr] = m;
 		if (!path || !startStr) continue;
 		const key = `${path}:${startStr}${endStr ? `-${endStr}` : ""}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
-		const direct = isAbsolute(path) ? path : join(cwd, path);
-		let abs: string | undefined;
-		if (existsSync(direct) && statSync(direct).isFile()) {
-			abs = direct;
-		} else {
-			// Dependency citations: research/design artifacts legitimately cite installed
-			// dependency source (lockfile-pinned, so line numbers are stable). Probe
-			// `node_modules/<path>` and `node_modules/@<path>` — the latter because the
-			// citation regex cannot carry `@`, so a cited `node_modules/@scope/pkg/f.js`
-			// parses as `scope/pkg/f.js`. DIRECT probes only: the suffix-fallback walk
-			// still skips node_modules, so a bare basename never resolves into a dep.
-			for (const candidate of [join(cwd, "node_modules", path), join(cwd, "node_modules", `@${path}`)]) {
-				if (existsSync(candidate) && statSync(candidate).isFile()) {
-					abs = candidate;
-					break;
-				}
-			}
+		const resolved = resolveCitationPath(path, cwd, indexHolder);
+		if (resolved && "ambiguous" in resolved) {
+			// More than one tree file matches — name the candidates so the fix arm can disambiguate.
+			const shown = resolved.ambiguous
+				.slice(0, 3)
+				.map((a) => (a.startsWith(cwd + sep) ? a.slice(cwd.length + 1) : a));
+			findings.push({
+				detail: `Unbacked citation ${key} — ${path} matches ${resolved.ambiguous.length} tree files (${shown.join(", ")}${resolved.ambiguous.length > shown.length ? ", …" : ""}); a citation must name ONE file. Disambiguate with the repo-root-relative path.`,
+				where: key,
+			});
+			continue;
 		}
-		if (!abs) {
-			// Suffix fallback: back the citation iff exactly ONE tree file matches.
-			const matches = suffixMatches(path);
-			if (matches.length === 1) {
-				abs = matches[0];
-			} else if (matches.length > 1) {
-				const shown = matches.slice(0, 3).map((a) => (a.startsWith(cwd + sep) ? a.slice(cwd.length + 1) : a));
-				findings.push({
-					detail: `Unbacked citation ${key} — ${path} matches ${matches.length} tree files (${shown.join(", ")}${matches.length > shown.length ? ", …" : ""}); a citation must name ONE file. Disambiguate with the repo-root-relative path.`,
-					where: key,
-				});
-				continue;
-			}
-		}
+		const abs = resolved?.abs;
 		if (!abs) {
 			findings.push({
 				detail: `Unbacked citation ${key} — the cited file does not exist at this revision. A file:line citation must resolve, or the line numbers must be omitted. Fix the path (repo-root-relative, or node_modules/<pkg>/… for an installed dependency file) or drop the citation.`,
