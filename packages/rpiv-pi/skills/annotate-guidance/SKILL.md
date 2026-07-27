@@ -210,6 +210,7 @@ You are tasked with generating architecture guidance files for a brownfield proj
    - Write each file to `.rpiv/guidance/{relative_path}/architecture.md`. For the root file, write to `.rpiv/guidance/architecture.md`. Create any intermediate directories that do not exist.
    - Write ALL files at once using the Write tool
    - Do NOT ask for confirmation before each file — batch mode
+   - **Record both forms of a formatter/auto-fixer.** Where the project has a formatter or auto-fixer, record BOTH its repo-wide form AND its path-scoped form (the invocation that rewrites only the paths it is given) in the `# Commands` table — phase-scoped verification depends on the scoped form being known, because a phase's `#### Automated Verification:` command must be write-scoped to that phase's own `files:` set.
    - After writing, present a summary:
      ```
      ## Architecture Guidance Files Created

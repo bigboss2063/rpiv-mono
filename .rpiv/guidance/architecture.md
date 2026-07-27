@@ -37,6 +37,7 @@ rpiv-mono/
 |---|---|
 | `npm install` | One install at root; workspace symlinks under `node_modules/` |
 | `npm run check` | Biome (`--write --error-on-warnings`) + `tsc --noEmit -p tsconfig.base.json` |
+| `npm run check:files -- <paths...>` | Path-scoped Biome (`--write --error-on-warnings`) — rewrites ONLY the paths it is given; the scoped form a phase's `#### Automated Verification:` uses to stay write-scoped to its own `files:` set |
 | `npm test` | Vitest at root (single runner; `include: ['packages/*/**/*.test.ts']` walks every package) |
 | `npm run build:site` | Build the Astro marketing site (`packages/rpiv-site`) — separate from publish |
 | `npm run coverage` | Vitest with V8 coverage |

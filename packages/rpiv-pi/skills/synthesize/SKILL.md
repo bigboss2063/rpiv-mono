@@ -92,7 +92,7 @@ Copy values verbatim. `<iso>` is the first tab-separated field; `<slug>` is the 
    - **Integration** — wire the seams: an input that depends on another's interface must reference the real shape the other defines. In root mode, this is where each sub-plan's `exports` get connected.
    - **Conflict** — when two inputs make incompatible decisions, resolve to one, and record the resolution in Synthesis Notes (the grade panel's correctness/architecture-fit members will check it).
    - **Risk flags** — a decision you're not confident is correct (an unverified assumption, an edge case wanting a second opinion) goes in the frontmatter `risks:` array as a `{ id, claim }` entry (stable `id`; `claim` = the one-line assertion to rule on) plus a `## Risk Flags` line — **never** buried in prose. This is the first-class channel grade and validate are REQUIRED to rule on; flag anything you'd otherwise write "flagging this so the grade panel can weigh in" about.
-3. **Sequence phases** — one phase per slice (flat/partial) or carry the sub-plans' phases through (root), ordered so a phase never precedes one it `depends_on`. Tightly-coupled units may merge into one phase; note any merge.
+3. **Sequence phases** — one phase per slice (flat/partial) or carry the sub-plans' phases through (root), ordered so a phase never precedes one it `depends_on`. Tightly-coupled units may merge into one phase; note any merge. Populate each entry's `files:` from that phase's `### Changes` paths (every repo-root-relative path the phase creates or edits) and `depends_on` only for semantic ordering NOT visible in `files:` (a phase that needs an earlier phase to run first despite no shared file) — lower `n` only.
 4. **Write the output** (below), `status: ready`:
    - **Flat / root** → a standard **plan** in `.rpiv/artifacts/plans/` — phases with concrete changes and Success Criteria that pass through unchanged to `implement`/`validate`.
    - **Partial** (`--as-subplan`) → a **sub-plan** in `.rpiv/artifacts/subplans/` — the same phase shape PLUS a `summary` and an `exports` block naming the seams (files/symbols/interfaces this cluster owns) the root will wire other clusters into. Keep it compact: the root reads it instead of your cluster's designs.
@@ -125,8 +125,8 @@ topic: "<topic>"
 status: ready
 phase_count: <N>
 phases:
-  - { n: 1, title: "<title>", slice: 1 }
-  - { n: 2, title: "<title>", slice: 2 }
+  - { n: 1, title: "<title>", slice: 1, files: ["path/to/file.ts"], depends_on: [] }
+  - { n: 2, title: "<title>", slice: 2, files: ["path/to/other.ts"], depends_on: [1] }
 risks:
   - { id: r1, claim: "<a decision you want the grade panel + validate to rule on>" }
 sources: [<each --designs path>, <--research path>]
@@ -160,6 +160,8 @@ tags: [plan, synthesized]
 ## Hard rules
 
 - Exactly one `## Phase N:` heading per `phases:` entry; `phase_count` == array length == heading count. Number `n` contiguously `1..N`.
+- **`files:` contract.** Every path a phase creates or edits MUST be listed in that phase's `files:` array (repo-root-relative, never a bare basename) — the same floor-backing reason body citations carry: the plan-time coverage floor (`plan-cite-check`/`code-cite-check`) flags a body edit path absent from `files:`, and a later dep-gated implement fanout derives phase edges from `files:` overlap. A `files:`-less entry degrades to "no check" (legacy-safe), but a `synthesize` plan always declares `files:`.
+- **Write-scope rule (per-phase, mandatory before parallel implement).** Every command in a phase's `#### Automated Verification:` block must be **write-scoped to that phase's own `files:` set** — running it must not modify anything outside the phase's `files:`. Phases run concurrently under build's parallel implement lane, so a command that rewrites the wider tree corrupts a sibling phase's in-flight edit; narrow any formatter or auto-fixer to the phase's paths (take the project's command vocabulary from its guidance `# Commands` table — where the table gives only an unscoped form, narrow it to the phase's paths rather than substituting a different tool). Read-only repo-wide commands (a type check, a non-fixing lint, a scoped test selection) are permitted. Whole-repo build/test verification belongs to the plan's final whole-plan block, owned by `validate` — never to a phase.
 - **Reconcile, don't redesign.** Preserve each slice's decisions; only resolve where slices collide or must connect.
 - **Plan-compatible output.** Phases + Success Criteria in the standard plan shape so `implement` and `validate` consume it with no changes.
 - **No subagents. No self-review. No questions.** Merge, record open risks in Synthesis Notes, write.

@@ -276,7 +276,7 @@ Generate complete, copy-pasteable code AND the slice's `### Success Criteria:` f
 - **Modified files**: read current file FULLY, generate only the modified/added code scoped to changed sections (no full "Current" block — the original is on disk)
 - **Test files**: complete test suites following project patterns
 - **Wiring**: show where new code hooks into existing code
-- **Success Criteria**: derive `### Success Criteria:` from this slice's file changes plus `## Verification Notes` entries that map to this slice's scope. Use the same `- [ ]` format as 6.4 (see template below). Project-baseline checks (`npm run check`, `npm test`) go on the terminal slice only. Commands in backticks. Criteria authored here flow through to plan as the phase's Success Criteria — slice ≡ phase, 1:1.
+- **Success Criteria**: derive `### Success Criteria:` from this slice's file changes plus `## Verification Notes` entries that map to this slice's scope. Use the same `- [ ]` format as 6.4 (see template below). Project-baseline checks (the project's whole-repo build/test commands, from its guidance `# Commands` table) go on the terminal slice only. Commands in backticks. Criteria authored here flow through to plan as the phase's Success Criteria — slice ≡ phase, 1:1.
 
 If additional context is needed, spawn a targeted **codebase-analyzer** agent.
 
@@ -336,8 +336,8 @@ Use the `ask_user_question` tool to confirm. Question: "Slice {N/M}: {slice name
    **Files**: `path/to/file1.ext`, `path/to/file2.ext`
 
    #### Automated Verification:
-   - [ ] Type checking passes: `npm run check`
-   - [ ] Tests pass: `npm test`
+   - [ ] Type checking passes: `{project typecheck command}`
+   - [ ] Tests pass: `{project test command}`
    - [ ] Grep pattern from Verification Note: `grep -r "newApi" packages/ | wc -l` returns >= 3
 
    #### Manual Verification:

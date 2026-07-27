@@ -73,8 +73,8 @@ If you encounter a mismatch:
 ## Verification Approach
 
 After implementing a phase:
-- **Sequential full-plan mode:** run the success criteria checks (usually `make check test` covers everything).
-- **Single-phase mode:** run **only the commands under the named phase's own `#### Automated Verification:` block** — and flip exactly those `- [ ]` → `- [x]`. Do **not** gate completion on the whole `make check test` / full-test suite: that runs sibling phases' not-yet-present code and is the downstream `validate` stage's job (whole-plan / cross-phase validation), not implement's.
+- **Sequential full-plan mode:** run the plan's own whole-plan success-criteria commands (the project's build + test commands, as recorded in its guidance `# Commands` table).
+- **Single-phase mode:** run **only the commands under the named phase's own `#### Automated Verification:` block** — and flip exactly those `- [ ]` → `- [x]`. Do **not** gate completion on the project's whole-repo build/test command: that runs sibling phases' not-yet-present code and is the downstream `validate` stage's job (whole-plan / cross-phase validation), not implement's. Under build's parallel implement lane, sibling phases run concurrently in the same working tree; the tree shows their in-flight changes — verify only your own phase's `files:`, and keep every command you run write-scoped to that set (a command that rewrites the wider tree corrupts a sibling's in-flight edit; narrow any formatter/auto-fixer to the phase's paths).
 - Fix any issues before proceeding
 - Update your progress in both the plan and your todos
 - Check off completed items in the plan file itself using Edit

@@ -370,6 +370,9 @@ Use the `ask_user_question` tool to confirm. Question: "Slice {N/M}: {slice name
    - [ ] New widget renders correctly above the editor
    - [ ] Performance acceptable with 1000+ todo items
    ```
+
+   **Write-scope rule (per-phase, mandatory before parallel implement):** every command in a phase's `#### Automated Verification:` block must be **write-scoped to that phase's own `files:` set** — running it must not modify anything outside the phase's `files:`. Phases run concurrently under build's parallel implement lane, so a command that rewrites the wider tree corrupts a sibling phase's in-flight edit; narrow any formatter or auto-fixer to the phase's paths (take the project's command vocabulary from its guidance `# Commands` table — where the table gives only an unscoped form, narrow it to the phase's paths rather than substituting a different tool). Read-only repo-wide commands (a type check, a non-fixing lint, a scoped test selection) are permitted. Whole-repo build/test verification belongs to the plan's final whole-plan block, owned by `validate` — never to a phase.
+
 5. Update the Plan History section: `- Phase N: {name} — approved as generated`
 6. Decrement frontmatter `unresolved_phase_count` by 1
 - Proceed to next slice
@@ -393,11 +396,11 @@ The artifact was created as a skeleton in Step 5 and filled progressively in Ste
 
    If any check fails, return to Step 6. Do NOT flip status. (7.1 and 7.2 guard the same invariant — empty content ↔ unresolved counter.)
 
-   Then **rebuild the `phases:` frontmatter array from the `## Phase N:` headings** — one `{ n, title }` entry per section, in body order:
+   Then **rebuild the `phases:` frontmatter array from the `## Phase N:` headings** — one `{ n, title, files, depends_on }` entry per section, in body order. Populate `files:` from each phase's `#### N. path/to/file.ext` + `**File**:` entries and `depends_on` (lower `n` only) from the decomposition's `Depends on:` lines:
    ```yaml
    phases:
-     - { n: 1, title: Schema layer }
-     - { n: 2, title: Runtime wiring }
+     - { n: 1, title: Schema layer, files: [src/schema.ts], depends_on: [] }
+     - { n: 2, title: Runtime wiring, files: [src/runtime.ts], depends_on: [1] }
    ```
 
 3. **Update frontmatter** via Edit: `status: in-progress` → `status: in-review` (Step 9 flips to `ready` after triage — keeps consumers off an artifact still being edited). Leave `last_updated` / `last_updated_by` as-is.
