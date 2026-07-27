@@ -9,7 +9,8 @@
  *     ran concurrently";
  *   - optionally BLOCKS on a shared gate (`gate: true`) until `release()` so the
  *     test can freeze the run with the first `maxConcurrency` children in flight,
- *     inspect, then let it drain;
+ *     inspect, then let it drain — narrowable to a subset via `gateWhen` so ONE
+ *     unit can be held while its siblings run to completion;
  *   - synthesizes a guaranteed-in-session child ctx (carrying `sendUserMessage`)
  *     whose `getBranch()` returns a scripted transcript — the parent ctx STAYS
  *     VALID (no swap).
@@ -45,6 +46,11 @@ export interface FakeConcurrentHostOptions {
 	/** When true, every spawnChild BLOCKS until `release()` resolves the shared
 	 *  gate — freezing the run with the first `maxConcurrency` children in flight. */
 	gate?: boolean;
+	/** Narrows `gate` to the spawns this predicate accepts; the rest run straight
+	 *  through. Lets a test hold ONE unit in flight while its siblings complete —
+	 *  the shape needed to prove a dependent opens on ITS OWN dep rather than on an
+	 *  unrelated straggler. Ignored unless `gate` is set. */
+	gateWhen?: (rec: FakeSpawnRecord) => boolean;
 	/** Build the child's transcript branch for a spawn. Default: one assistant
 	 *  message naming a unique `.rpiv/artifacts/<bucket>/unit-<n>.md` path so the
 	 *  standard md collector succeeds. Return a message with `stopReason:"aborted"`
@@ -162,7 +168,7 @@ export function createFakeConcurrentHost(opts: FakeConcurrentHostOptions = {}): 
 		if (active > maxActive) maxActive = active;
 		notifyActiveWaiters();
 		try {
-			if (opts.gate) await gatePromise;
+			if (opts.gate && (opts.gateWhen?.(rec) ?? true)) await gatePromise;
 			// reattach opens a persisted session WITHOUT replaying the prompt — model
 			// that as an empty resumed transcript for the body to promote from.
 			const branch = options.reattach ? [] : childBranch(rec, index);

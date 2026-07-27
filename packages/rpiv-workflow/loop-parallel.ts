@@ -1,30 +1,37 @@
 /**
- * loop-parallel.ts — bounded-parallel, dependency-ordered fanout dispatch. Fanout
- * units fold into the cursor in DECLARED (index) order through `foldFanoutCompletion`
- * — never completion order — so `fanin` synthesis + resume stay deterministic at every
- * concurrency (Semaphore(1) just serializes). When units declare `Unit.deps`, the
- * scheduler dispatches in Kahn TOPOLOGICAL LEVELS (`computeWaveLevels`, loop-waves.ts):
- * one bounded-parallel wave per level, a dependent never opening before the units it
- * depends on have filled their slots. A deps-free fanout has ONE level — byte-identical
- * to the pre-wave flat dispatch.
+ * loop-parallel.ts — bounded-parallel, dependency-GATED fanout dispatch. Every active
+ * unit is dispatched into ONE generation-wide semaphore and awaits ITS OWN `Unit.deps`
+ * — not a topological level — so a dependent opens the instant its deps have filled
+ * their slots, even while unrelated siblings are still running. Kahn levels
+ * (`computeWaveLevels`, loop-waves.ts) remain the CYCLE GUARD and supply the dispatch
+ * ORDER (level asc, index asc); they are no longer a barrier. A deps-free fanout is a
+ * flat dispatch, and a cap-1 fanout (`implement`) dispatches in exactly declared order.
  *
- * CONCURRENCY MODEL — what is and isn't fold-confined. ONLY the `LoopCursor`
- * (`slots`/`filledCount`/`lastProduce`) is mutated exclusively by the serial
- * post-`allSettled` fold below. `run.state` is NOT: each worker's `postStage` mutates
- * `lastAllocatedStageNumber`, `stagesCompleted`, `output`, `primaryArtifact`
- * CONCURRENTLY across siblings. That is safe — every such mutator is a synchronous,
- * `await`-free read-modify-write (JS run-to-completion makes each atomic), and every
- * order-sensitive result is re-derived by the index-addressed fold or overwritten by
- * `projectResult` at close.
+ * Deps are awaited BEFORE the semaphore is acquired — a waiting dependent never holds a
+ * slot, so hold-and-wait (and with it deadlock) cannot arise; the DAG is acyclic by the
+ * guard above.
  *
- * `runFanoutWaves` is the ONE orchestrator both the live entry (`runFanoutParallel`)
+ * CONCURRENCY MODEL — why a per-unit fold is safe. Each unit folds itself through
+ * `foldFanoutCompletion` in its own continuation, so the cursor is now advanced from
+ * many continuations rather than one serial post-`allSettled` pass. That is safe for the
+ * same reason `run.state` already was: every mutator is a synchronous, `await`-free
+ * read-modify-write (JS run-to-completion makes each atomic), AND the fold is
+ * COMMUTATIVE by construction — `slots[i]` is index-addressed, `filledCount` is
+ * recomputed by `reduce` over the whole array (never incremented), and `lastProduce` is
+ * derived by `lastNonFailedSlot` scanning slots high→low. Declared order therefore
+ * survives completion order without a barrier. The one genuinely order-sensitive write,
+ * `state.primaryArtifact`, is last-writer-wins during dispatch either way (each worker's
+ * `postStage` already races it) and is overwritten by `projectResult` at close. The
+ * durable trail is likewise completion-ordered already, and resume places by
+ * `row.unitIndex`, never by trail order.
+ *
+ * `runFanoutGeneration` is the ONE orchestrator both the live entry (`runFanoutParallel`)
  * and the resume re-dispatch (`runFanoutResume`) — both thin wrappers in loop.ts —
  * degenerate to: each passes its `active` operand set (live: `0..dispatchCount-1`;
  * resume: the still-pending indices) and a `finalTail` for the path-specific completion
  * (live: hitCap-vs-finishLoop on the cap; resume: always finishLoop). It owns ONE
- * per-generation `genAbort` across every wave (so a fail-fast halt or run-abort in wave
- * k cancels in-flight siblings AND prevents wave k+1), computes the levels, intersects
- * each with `active`, and runs `dispatchWave` per non-empty level.
+ * per-generation `genAbort` (so a fail-fast halt or run-abort cancels in-flight siblings
+ * AND rejects every queued acquire), computes the order, and runs the generation.
  *
  * This module is a downward leaf: it consumes the shared loop foundation
  * (`loop-kinds.ts`, `loop-waves.ts`) and never imports loop.ts back (loop.ts → here only).
@@ -58,19 +65,19 @@ const fanoutUnitRef = (e: LoopEntry, i: number): UnitRef => {
 };
 
 /**
- * THE wave orchestrator — owns ONE per-generation `AbortController` across every
- * topological level. Computes Kahn levels over the full unit list, intersects each
- * with `active` (live: the first-cap indices; resume: the still-pending indices), and
- * dispatches the non-empty levels in order. The LAST active level runs `finalTail`
- * (live: hitCap-vs-finishLoop; resume: finishLoop); intermediate levels just settle.
+ * THE generation orchestrator — owns ONE per-generation `AbortController` and ONE
+ * semaphore across every active unit. Computes the Kahn levels over the full unit list
+ * (the cycle guard) and flattens them into the dispatch ORDER, intersected with `active`
+ * (live: the first-cap indices; resume: the still-pending indices). Runs `finalTail`
+ * (live: hitCap-vs-finishLoop; resume: finishLoop) once the generation settles.
  *
  * The `genAbort` fires on EITHER (a) run-level abort (Ctrl-C, `run.signal` — propagated
- * below) OR (b) the first fail-fast unit halt inside `dispatchWave`. The listener is
- * dropped BEFORE `finalTail` (which runs the downstream chain) so it never accumulates
+ * below) OR (b) the first fail-fast unit halt inside `dispatchGeneration`. The listener
+ * is dropped BEFORE `finalTail` (which runs the downstream chain) so it never accumulates
  * across stages. Levels are computed BEFORE the listener is wired, so a defensive
  * cycle-throw from `computeWaveLevels` can't leak it.
  */
-export async function runFanoutWaves(
+export async function runFanoutGeneration(
 	curCtx: WorkflowHostContext,
 	e: LoopEntry,
 	cursor: LoopCursor,
@@ -80,14 +87,19 @@ export async function runFanoutWaves(
 	finalTail: () => Promise<void> | void,
 ): Promise<void> {
 	const activeSet = new Set(active);
-	const waves = computeWaveLevels(e.units!, e.name)
-		.map((level) => level.filter((i) => activeSet.has(i)))
-		.filter((level) => level.length > 0);
-	// Resolve the dep→artifact identity map once (only when the flag is set).
-	const idToIndex = e.loop.kind === "fanout" && e.loop.depArtifactFlag ? unitIdIndex(e.units!) : undefined;
+	// Levels earn their keep twice over, and neither use is a barrier: `computeWaveLevels`
+	// THROWS `invariantPreflight` on a dependency cycle (the defensive guard), and its
+	// flattening is the dispatch order — level asc, index asc, i.e. the order the wave
+	// scheduler used, so a cap-1 fanout stays byte-identical.
+	const order = computeWaveLevels(e.units!, e.name)
+		.flat()
+		.filter((i) => activeSet.has(i));
+	// The dep→index map is resolved unconditionally now: dep GATING needs it whether or
+	// not `depArtifactFlag` is set. `depArtifactSuffix` keeps its own flag guard.
+	const idToIndex = unitIdIndex(e.units!);
 	// No active units (e.g. a resume with everything already filled) — still close the
 	// loop via the tail (projection + advance), matching today's empty/all-done path.
-	if (waves.length === 0) return finalTail();
+	if (order.length === 0) return finalTail();
 
 	const genAbort = new AbortController();
 	// Name the handler so it can be REMOVED once this generation settles — run.signal
@@ -99,35 +111,24 @@ export async function runFanoutWaves(
 	}
 	const detach = () => run.signal?.removeEventListener("abort", onRunAbort);
 
-	for (let w = 0; w < waves.length; w++) {
-		await dispatchWave(curCtx, e, cursor, run, deps, waves[w]!, genAbort, idToIndex);
-		// Cross-wave gates — the same two checks the single-dispatch tail made, now
-		// BETWEEN waves so a wave-k failure prevents wave-(k+1) dispatch. A fail-fast
-		// halt already terminated state inside the worker; a run abort drained the
-		// semaphore and rejects every later acquire.
-		if (run.state.termination.status !== "running") {
-			detach();
-			return;
-		}
-		if (run.signal?.aborted) {
-			detach();
-			return deps.recordAborted(curCtx, e.name, run); // mid-flight abort → FAIL_WORKFLOW_ABORTED
-		}
-	}
-	detach(); // all waves settled cleanly — drop the run-lifetime listener BEFORE the tail
+	await dispatchGeneration(curCtx, e, cursor, run, deps, order, genAbort, idToIndex);
+	detach(); // generation settled — drop the run-lifetime listener BEFORE the tail
+
+	// The same two gates the wave loop ran between levels, now once at the end: a
+	// fail-fast halt already terminated state inside the worker and aborted its
+	// siblings; a run abort drained the semaphore and rejected every later acquire.
+	if (run.state.termination.status !== "running") return;
+	if (run.signal?.aborted) return deps.recordAborted(curCtx, e.name, run); // mid-flight abort → FAIL_WORKFLOW_ABORTED
 	return finalTail();
 }
 
 /**
- * Dispatch ONE topological level's operands through a shared semaphore + the
- * per-generation `genAbort`, folding each result at its DECLARED index. The body the
- * former single-shot `runFanoutDispatch` ran, MINUS the genAbort lifecycle (the
- * orchestrator owns it across waves) and the terminal disposition (the orchestrator
- * runs the tail once, after the last wave). NEVER throws — an unexpected worker
- * rejection lands a terminal-failure row via `recordWorkerThrow`; allSettled
- * guarantees every unit settled.
+ * Dispatch the whole generation through a shared semaphore + the per-generation
+ * `genAbort`, each unit gated on ITS OWN deps and folding itself at its DECLARED index.
+ * NEVER throws — an unexpected worker rejection lands a terminal-failure row via
+ * `recordWorkerThrow`; allSettled guarantees every unit settled.
  */
-async function dispatchWave(
+async function dispatchGeneration(
 	curCtx: WorkflowHostContext,
 	e: LoopEntry,
 	cursor: LoopCursor,
@@ -135,7 +136,7 @@ async function dispatchWave(
 	deps: LoopDeps,
 	ops: readonly number[],
 	genAbort: AbortController,
-	idToIndex: Map<string, number> | undefined,
+	idToIndex: Map<string, number>,
 ): Promise<void> {
 	const failFast = isFailFast(e.loop);
 	// A fanout may cap its own concurrency BELOW the host cap (`implement`'s
@@ -145,35 +146,55 @@ async function dispatchWave(
 		Math.max(1, Math.min(loopCap ?? curCtx.maxConcurrency, curCtx.maxConcurrency)),
 		genAbort.signal,
 	); // drains queued units on either abort
-	const settled = await Promise.allSettled(
-		ops.map((i) => {
-			// Resolve `--upstream`-style dep-artifact injection from the slots prior waves
-			// already filled. Empty when the loop sets no flag or the unit has no deps.
-			const suffix = idToIndex ? depArtifactSuffix(e, cursor, i, idToIndex) : "";
-			return sem
-				.run(() => dispatchUnitDetached(curCtx, e, i, run, deps, genAbort.signal, suffix))
-				.then((out) => {
-					// a fail-fast unit's worker terminated state via recordTerminalFailure;
-					// fire genAbort so in-flight siblings get session.abort()'d NOW.
-					if (failFast && run.state.termination.status !== "running") genAbort.abort();
-					return out;
-				});
+
+	// One readiness latch per DISPATCHED unit, index-addressed. A dep with no latch is
+	// already settled: either it is outside `ops` (a resume whose prior invocation filled
+	// the slot) or it is dangling (`computeWaveLevels` treats those as satisfied too —
+	// `validateUnitDeps` owns the dangling report).
+	const latch = new Array<Promise<void> | undefined>(e.units!.length);
+	const open = new Array<(() => void) | undefined>(e.units!.length);
+	for (const i of ops)
+		latch[i] = new Promise<void>((resolve) => {
+			open[i] = resolve;
+		});
+	const depLatches = (i: number): Promise<void>[] =>
+		(e.units![i]!.deps ?? []).flatMap((d) => {
+			const di = idToIndex.get(d);
+			const l = di === undefined ? undefined : latch[di];
+			return l ? [l] : [];
+		});
+
+	await Promise.allSettled(
+		ops.map(async (i) => {
+			// Await THIS unit's deps — never a whole level — and do it BEFORE acquiring a
+			// slot, so a waiting dependent never holds one.
+			await Promise.all(depLatches(i));
+			try {
+				// Resolve `--upstream`-style dep-artifact injection from the slots this
+				// unit's deps just filled. Empty when the loop sets no flag or no deps.
+				const suffix = depArtifactSuffix(e, cursor, i, idToIndex);
+				const out = await sem.run(() => dispatchUnitDetached(curCtx, e, i, run, deps, genAbort.signal, suffix));
+				// ONE synchronous block, and its order is load-bearing. (1) A fail-fast
+				// unit's worker terminated state via recordTerminalFailure — fire genAbort
+				// so in-flight siblings get session.abort()'d NOW and no dependent released
+				// below can still slip into the semaphore. (2) Fold BEFORE the latch opens:
+				// a dependent's `depArtifactSuffix` reads `cursor.slots`, so an early
+				// release would make it design blind for this dep.
+				if (failFast && run.state.termination.status !== "running") genAbort.abort();
+				cursor.ranThisInvocation++;
+				// index-addressed placement (shared with the resume fold) so declared order
+				// survives parallel completion + dep gating + resume.
+				foldFanoutCompletion(run.state, cursor, e.def, e.name, i, e.units!.length, out);
+			} catch (reason) {
+				// aborted / never-started → unfilled slot (resume re-dispatches)
+				if (!isAbortError(reason)) await deps.recordWorkerThrow(curCtx, fanoutUnitRef(e, i), e.skill, run, reason);
+			} finally {
+				// Dependents proceed even when this unit failed — `depArtifactSuffix` skips
+				// a failed/unfilled slot, so they design blind for it rather than stalling.
+				open[i]?.();
+			}
 		}),
 	);
-	// `ops[k]` maps the k-th settled result back to its DECLARED unit index.
-	for (let k = 0; k < settled.length; k++) {
-		const r = settled[k]!;
-		const i = ops[k]!;
-		if (r.status === "rejected") {
-			if (isAbortError(r.reason)) continue; // aborted / never-started → unfilled slot (resume re-dispatches)
-			await deps.recordWorkerThrow(curCtx, fanoutUnitRef(e, i), e.skill, run, r.reason);
-			continue;
-		}
-		cursor.ranThisInvocation++;
-		// index-addressed placement (shared with the resume fold) so declared order
-		// survives parallel completion + waves + resume.
-		foldFanoutCompletion(run.state, cursor, e.def, e.name, i, e.units!.length, r.value);
-	}
 }
 
 /**

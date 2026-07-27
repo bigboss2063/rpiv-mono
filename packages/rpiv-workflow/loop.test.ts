@@ -19,7 +19,7 @@ import {
 	createMockSessionChain,
 	mockAssistantMessage,
 } from "@juicesharp/rpiv-test-utils";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	acts,
 	defineRoute,
@@ -715,6 +715,76 @@ describe("loop driver — DAG-ordered wave dispatch", () => {
 		expect(host.spawns).toHaveLength(3);
 		host.release();
 		expect((await p).success).toBe(true);
+	});
+
+	// THE dep-gating proof — the case a level barrier gets wrong. `dep` sits one Kahn
+	// level above `root`, and `straggler` is an UNRELATED level-0 unit. Under
+	// level-barrier dispatch `dep` waits for the whole of level 0, so a slow straggler
+	// strands it with free slots; gated on its own dep it opens as soon as `root` folds.
+	it("opens a dependent as soon as ITS dep folds, not when the whole level drains", async () => {
+		const units: Unit[] = [
+			{ prompt: "root", label: "root", id: "root" },
+			{ prompt: "straggler", label: "straggler", id: "straggler" },
+			{ prompt: "dep", label: "dep", id: "dep", deps: ["root"] },
+		];
+		const host = createFakeConcurrentHost({
+			cwd: tmpDir,
+			maxConcurrency: 4,
+			gate: true,
+			gateWhen: (rec) => rec.prompt.includes("straggler"), // hold ONLY the straggler
+			bucket: "designs",
+		});
+		const p = runWorkflow(host.ctx, { workflow: dagWf(units), input: "x" });
+
+		// `root` runs through, folds, and releases `dep` — all while `straggler` is still
+		// in flight. On the level-barrier scheduler `dep` never appears here.
+		await host.waitForActive(1);
+		await vi.waitFor(() => expect(host.spawns.map((s) => s.prompt).some((p2) => p2.includes("dep"))).toBe(true));
+		expect(host.spawns.find((s) => s.prompt.includes("straggler"))!.endOrder).toBe(-1); // still blocked
+
+		host.release();
+		expect((await p).success).toBe(true);
+		expect(host.spawns).toHaveLength(3);
+	});
+
+	it("still injects --upstream when the dep folded moments earlier (fold precedes latch release)", async () => {
+		const units: Unit[] = [
+			{ prompt: "root", label: "root", id: "root" },
+			{ prompt: "straggler", label: "straggler", id: "straggler" },
+			{ prompt: "dep", label: "dep", id: "dep", deps: ["root"] },
+		];
+		const host = createFakeConcurrentHost({
+			cwd: tmpDir,
+			maxConcurrency: 4,
+			gate: true,
+			gateWhen: (rec) => rec.prompt.includes("straggler"),
+			bucket: "designs",
+		});
+		const p = runWorkflow(host.ctx, { workflow: dagWf(units), input: "x" });
+		await vi.waitFor(() => expect(host.spawns.some((s) => s.prompt.includes("dep"))).toBe(true));
+		host.release();
+		expect((await p).success).toBe(true);
+		// `dep` dispatched while `straggler` was mid-flight, yet still carries root's path:
+		// the fold landed in `cursor.slots` BEFORE the readiness latch opened.
+		expect(host.spawns.find((s) => s.prompt.includes("dep"))!.prompt).toContain("--upstream");
+	});
+
+	it("dispatches in declared order at concurrency 1 (regression: the `implement` lane)", async () => {
+		const serialWf = {
+			name: "dag",
+			start: "design",
+			stages: {
+				design: produces({
+					outcome: mdOutcome("designs"),
+					loop: fanout({ concurrency: 1, depArtifactFlag: "--upstream", units: () => chain }),
+				}),
+			},
+			edges: { design: "stop" } as Record<string, string>,
+		};
+		const host = createFakeConcurrentHost({ cwd: tmpDir, maxConcurrency: 5, bucket: "designs" });
+		expect((await runWorkflow(host.ctx, { workflow: serialWf, input: "x" })).success).toBe(true);
+		expect(host.maxActive).toBe(1);
+		expect(host.spawns.map((s) => s.prompt.match(/s\d/)![0])).toEqual(["s1", "s2", "s3"]);
 	});
 });
 
