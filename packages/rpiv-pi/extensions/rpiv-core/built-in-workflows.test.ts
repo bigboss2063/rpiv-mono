@@ -17,6 +17,7 @@
  * They exercise the `Workflow` shape directly.
  */
 
+import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
@@ -248,6 +249,203 @@ describe("ship workflow", () => {
 				"/skill:implement .rpiv/artifacts/plans/plan.md Phase 2: Runtime wiring",
 			]);
 		});
+	});
+});
+
+describe("IMPLEMENT_DAG_FANOUT (build implement — dep-gated phase units)", () => {
+	let tmpDir: string;
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "rpiv-build-implement-dag-"));
+	});
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	const dagLoop = () => {
+		const loop = findWorkflow("build").stages.implement?.loop;
+		if (loop?.kind !== "fanout") throw new Error("build implement stage has no fanout loop");
+		return loop;
+	};
+	const writePlan = (rel: string, body: string) => {
+		const parts = rel.split("/");
+		mkdirSync(join(tmpDir, ...parts.slice(0, -1)), { recursive: true });
+		writeFileSync(join(tmpDir, rel), body);
+	};
+	const runFanout = (rel: string) =>
+		dagLoop().units({
+			cwd: tmpDir,
+			artifact: undefined,
+			state: {
+				named: { plans: [{ artifacts: [{ handle: fsHandle(rel) }], data: undefined, kind: "", meta: {} }] },
+			} as unknown as RunView,
+		});
+
+	it("is a spread of FRONTMATTER_PHASE_FANOUT with a distinct deps-emitting closure (unpinned)", () => {
+		const base = findWorkflow("ship").stages.implement?.loop;
+		if (base?.kind !== "fanout") throw new Error("ship implement stage has no fanout loop");
+		// IMPLEMENT_DAG_FANOUT shares the base's introspectable shape (spread)…
+		expect(dagLoop()).toMatchObject({
+			kind: "fanout",
+			source: "plans",
+			unit: { by: "frontmatter-array", pattern: "phases" },
+			max: 32,
+		});
+		// …but its units closure is distinct, it carries NO depArtifactFlag, and
+		// Phase 3 unpinned it (no `concurrency` ⇒ inherits the host cap).
+		expect(dagLoop().units).not.toBe(base.units);
+		expect(dagLoop().depArtifactFlag).toBeUndefined();
+		expect(dagLoop().concurrency).toBeUndefined();
+	});
+
+	it("emits phase-N ids + directed deps (clause A file-overlap + union of depends_on)", async () => {
+		const rel = ".rpiv/artifacts/plans/audited.md";
+		writePlan(
+			rel,
+			[
+				"---",
+				"status: ready",
+				"phase_count: 11",
+				"phases:",
+				"  - { n: 1, title: P1, files: [packages/a/one.ts] }",
+				"  - { n: 2, title: P2, files: [packages/a/X.ts] }",
+				"  - { n: 3, title: P3, files: [packages/a/X.ts, packages/a/Y.ts] }",
+				"  - { n: 4, title: P4, files: [packages/a/Y.ts] }",
+				"  - { n: 5, title: P5, files: [packages/c/five.ts] }",
+				"  - { n: 6, title: P6, files: [packages/c/six.ts] }",
+				"  - { n: 7, title: P7, files: [packages/c/seven.ts] }",
+				"  - { n: 8, title: P8, files: [packages/c/eight.ts] }",
+				"  - { n: 9, title: P9, files: [packages/b/Z.ts] }",
+				"  - { n: 10, title: P10, files: [packages/b/Z.ts] }",
+				"  - { n: 11, title: P11, files: [packages/b/W.ts], depends_on: [9] }",
+				"---",
+				"# Plan",
+				"## Phase 1: P1",
+				"## Phase 2: P2",
+				"## Phase 3: P3",
+				"## Phase 4: P4",
+				"## Phase 5: P5",
+				"## Phase 6: P6",
+				"## Phase 7: P7",
+				"## Phase 8: P8",
+				"## Phase 9: P9",
+				"## Phase 10: P10",
+				"## Phase 11: P11",
+				"",
+			].join("\n"),
+		);
+		const units = await runFanout(rel);
+		const depsByPhase = new Map(units.map((u) => [u.id, u.deps ?? []]));
+		expect(units.map((u) => u.id)).toEqual([
+			"phase-1",
+			"phase-2",
+			"phase-3",
+			"phase-4",
+			"phase-5",
+			"phase-6",
+			"phase-7",
+			"phase-8",
+			"phase-9",
+			"phase-10",
+			"phase-11",
+		]);
+		// File-overlap edges: 3∩2 (X), 4∩3 (Y), 10∩9 (Z).
+		expect(depsByPhase.get("phase-1")).toEqual([]);
+		expect(depsByPhase.get("phase-2")).toEqual([]); // no overlap with phase 1
+		expect(depsByPhase.get("phase-3")).toEqual(["phase-2"]); // overlaps phase 2 on X
+		expect(depsByPhase.get("phase-4")).toEqual(["phase-3"]); // overlaps phase 3 on Y (not phase 2)
+		expect(depsByPhase.get("phase-5")).toEqual([]); // unique path — root
+		expect(depsByPhase.get("phase-6")).toEqual([]);
+		expect(depsByPhase.get("phase-7")).toEqual([]);
+		expect(depsByPhase.get("phase-8")).toEqual([]);
+		expect(depsByPhase.get("phase-9")).toEqual([]); // unique path — root
+		expect(depsByPhase.get("phase-10")).toEqual(["phase-9"]); // overlaps phase 9 on Z
+		expect(depsByPhase.get("phase-11")).toEqual(["phase-9"]); // depends_on [9], no file overlap
+		// prompt/label unchanged from the base fanout.
+		expect(units[0]?.prompt).toBe(`${rel} Phase 1: P1`);
+		expect(units[0]?.label).toBe("phase 1/11");
+	});
+
+	it("degrades to the full chain when every phase omits files (clause B — serial at any cap)", async () => {
+		const rel = ".rpiv/artifacts/plans/no-files.md";
+		writePlan(
+			rel,
+			[
+				"---",
+				"status: ready",
+				"phase_count: 3",
+				"phases:",
+				"  - { n: 1, title: A }",
+				"  - { n: 2, title: B }",
+				"  - { n: 3, title: C }",
+				"---",
+				"# Plan",
+				"## Phase 1: A",
+				"## Phase 2: B",
+				"## Phase 3: C",
+				"",
+			].join("\n"),
+		);
+		const units = await runFanout(rel);
+		const depsByPhase = new Map(units.map((u) => [u.id, u.deps ?? []]));
+		expect(depsByPhase.get("phase-1")).toEqual([]);
+		expect(depsByPhase.get("phase-2")).toEqual(["phase-1"]);
+		expect(depsByPhase.get("phase-3")).toEqual(["phase-1", "phase-2"]);
+	});
+
+	it("dedups a file-overlap edge and an explicit depends_on to the same phase (union)", async () => {
+		const rel = ".rpiv/artifacts/plans/dup.md";
+		writePlan(
+			rel,
+			[
+				"---",
+				"status: ready",
+				"phase_count: 2",
+				"phases:",
+				"  - { n: 1, title: Root, files: [packages/d/shared.ts] }",
+				"  - { n: 2, title: Dup, files: [packages/d/shared.ts], depends_on: [1] }",
+				"---",
+				"# Plan",
+				"## Phase 1: Root",
+				"## Phase 2: Dup",
+				"",
+			].join("\n"),
+		);
+		const units = await runFanout(rel);
+		// phase-2 overlaps phase-1 on shared.ts AND lists 1 in depends_on → single edge.
+		expect(units[1]?.deps).toEqual(["phase-1"]);
+	});
+
+	it("build implement emits id/deps; ship implement does NOT (still on IMPLEMENT_PHASE_FANOUT)", async () => {
+		const rel = ".rpiv/artifacts/plans/distinct.md";
+		writePlan(
+			rel,
+			[
+				"---",
+				"status: ready",
+				"phase_count: 2",
+				"phases:",
+				"  - { n: 1, title: A }",
+				"  - { n: 2, title: B }",
+				"---",
+				"# Plan",
+				"## Phase 1: A",
+				"## Phase 2: B",
+				"",
+			].join("\n"),
+		);
+		const buildUnits = await runFanout(rel);
+		expect(buildUnits.every((u) => u.id !== undefined && Array.isArray(u.deps))).toBe(true);
+
+		const shipLoop = findWorkflow("ship").stages.implement?.loop;
+		if (shipLoop?.kind !== "fanout") throw new Error("ship implement stage has no fanout loop");
+		const shipUnits = await shipLoop.units({
+			cwd: tmpDir,
+			artifact: undefined,
+			state: {
+				named: { plans: [{ artifacts: [{ handle: fsHandle(rel) }], data: undefined, kind: "", meta: {} }] },
+			} as unknown as RunView,
+		});
+		expect(shipUnits.every((u) => u.id === undefined && u.deps === undefined)).toBe(true);
 	});
 });
 
@@ -746,6 +944,177 @@ describe("vet workflow", () => {
 			// 13 stages: cr×4 + bp×3 + impl×3 + validate×3. The 4th code-review's
 			// decision is blueprint's 3rd re-entry (> maxBackwardJumps=2).
 			expect(result.stagesCompleted).toBe(13);
+		});
+	});
+
+	// --- Phase 4: DAG fanout + scope-check rollout ---
+
+	describe("DAG fanout + scope-check rollout to vet", () => {
+		it("starts at goal and lists the goal + scope-check stages in linear order", () => {
+			const wf = findWorkflow("vet");
+			expect(wf.start).toBe("goal");
+			expect(Object.keys(wf.stages)).toEqual([
+				"goal",
+				"code-review",
+				"blueprint",
+				"implement",
+				"implement-scope-check",
+				"validate",
+				"commit",
+			]);
+		});
+
+		it("implement references the dep-gated DAG fanout (not IMPLEMENT_PHASE_FANOUT)", () => {
+			const loop = findWorkflow("vet").stages.implement?.loop;
+			expect(loopSpecOf(loop)).toMatchObject({
+				kind: "fanout",
+				source: "plans",
+				unit: { by: "frontmatter-array", pattern: "phases" },
+				max: 32,
+			});
+			// IMPLEMENT_DAG_FANOUT is the spread { ...FRONTMATTER_PHASE_FANOUT, units, … }
+			// — same source/unit/max as the base; the distinction is the
+			// deps-emitting units closure, asserted via the build implement lane's own
+			// tests (the DAG-specific behavior is shared across build + vet).
+		});
+
+		it("rewires the implement edge through the scope-check into validate, backward loop intact", () => {
+			const wf = findWorkflow("vet");
+			const edges = wf.edges;
+			expect(edges.goal).toBe("code-review");
+			expect(edges.blueprint).toBe("implement");
+			expect(edges.implement).toBe("implement-scope-check");
+			// The scope-check route is byte-for-byte Phase 3's build route (the `from`
+			// form suppresses the outputSchema lint → no schema on the script stage).
+			expect(wf.stages["implement-scope-check"]?.outputSchema).toBeUndefined();
+			expect(edges.validate).toBe("code-review"); // backward review-fix loop INTACT
+			expect(edges.commit).toBe("stop");
+		});
+
+		it("validates clean (goal published → reads:[plans,goal] resolves) with no unreachable stages", () => {
+			const wf = findWorkflow("vet");
+			const issues = deriveAndValidate(wf, { skillContracts: DECLARED_CONTRACTS });
+			expect(
+				issues.filter((i) => i.severity === "error"),
+				issues.map((i) => `${i.severity}: ${i.message}`).join("\n"),
+			).toEqual([]);
+			expect(
+				validateWorkflow(wf).filter((i) => /unreachable/.test(i.message)),
+				"vet has unreachable stages",
+			).toEqual([]);
+		});
+
+		it("ship and arch are unchanged — still IMPLEMENT_PHASE_FANOUT, no scope-check stage", () => {
+			for (const name of ["ship", "arch"]) {
+				const wf = findWorkflow(name);
+				expect(wf.start, `${name} start`).not.toBe("goal");
+				expect(Object.keys(wf.stages), `${name} stages`).not.toContain("goal");
+				expect(Object.keys(wf.stages), `${name} stages`).not.toContain("implement-scope-check");
+				// IMPLEMENT_PHASE_FANOUT (built-in-workflows.ts) is NOT deleted.
+				expect(wf.edges.implement, `${name} implement edge`).toBe("validate");
+			}
+		});
+	});
+
+	describe("implement-scope-check declared union (vet review-fix loop)", () => {
+		let tmpDir: string;
+
+		beforeEach(() => {
+			tmpDir = mkdtempSync(join(tmpdir(), "rpiv-vet-scope-"));
+		});
+
+		afterEach(() => {
+			rmSync(tmpDir, { recursive: true, force: true });
+		});
+
+		const scopeRun = () => {
+			const stage = findWorkflow("vet").stages["implement-scope-check"];
+			if (!stage?.run) throw new Error("vet implement-scope-check stage has no run function");
+			return stage.run as (ctx: { cwd: string; input?: undefined; state: RunView }) => {
+				data: Record<string, unknown>;
+			};
+		};
+		// Write a plan whose phase declares `files:` and return the channel entry.
+		const writePlan = (rel: string, files: string[]) => {
+			const parts = rel.split("/");
+			mkdirSync(join(tmpDir, ...parts.slice(0, -1)), { recursive: true });
+			writeFileSync(
+				join(tmpDir, rel),
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: Fix, files: [${files
+					.map((f) => JSON.stringify(f))
+					.join(", ")}] }\n---\n# Plan\n## Phase 1: Fix\n`,
+			);
+			return { artifacts: [{ handle: fsHandle(rel) }], data: undefined, kind: "", meta: {} } as unknown as Output;
+		};
+		const runOn = (plans: ReturnType<typeof writePlan>[], goal?: unknown) =>
+			scopeRun()({
+				cwd: tmpDir,
+				input: undefined,
+				state: { named: { plans, ...(goal ? { goal } : {}) } } as unknown as RunView,
+			}).data;
+		const exec = (cmd: string, args: string[]) =>
+			execFileSync(cmd, args, { cwd: tmpDir, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+		const gitInit = () => {
+			exec("git", ["init", "-q"]);
+			exec("git", ["config", "user.email", "t@t.test"]);
+			exec("git", ["config", "user.name", "test"]);
+		};
+		const where = (data: { findings?: { where?: string }[] }) => (data.findings ?? []).map((f) => f.where).sort();
+
+		it("unions files: across plan iterations — a prior iteration's declared path is not excess", () => {
+			gitInit();
+			const plan1 = writePlan(".rpiv/artifacts/plans/plan-1.md", ["packages/a/x.ts", "packages/b/y.ts"]);
+			const plan2 = writePlan(".rpiv/artifacts/plans/plan-2.md", ["packages/b/y.ts"]);
+			// Seed + commit the source tree (so dirty paths report per-file, not as a
+			// collapsed untracked dir), then modify the lanes-in-flight files.
+			mkdirSync(join(tmpDir, "packages/a"), { recursive: true });
+			mkdirSync(join(tmpDir, "packages/b"), { recursive: true });
+			mkdirSync(join(tmpDir, "packages/c"), { recursive: true });
+			writeFileSync(join(tmpDir, "packages/a/x.ts"), "v0");
+			writeFileSync(join(tmpDir, "packages/b/y.ts"), "v0");
+			writeFileSync(join(tmpDir, "packages/c/stray.ts"), "v0");
+			exec("git", ["add", "-A"]);
+			exec("git", ["commit", "-q", "-m", "baseline"]);
+			// plan1's file (x) + a stray (declared by neither plan) are now dirty.
+			writeFileSync(join(tmpDir, "packages/a/x.ts"), "v1");
+			writeFileSync(join(tmpDir, "packages/c/stray.ts"), "v1");
+
+			const data = runOn([plan1, plan2]);
+			expect(data.dimension).toBe("scope");
+			expect(data.pass).toBe(false);
+			// x.ts is covered by the union (plan1) → not excess; stray.ts is declared
+			// by neither iteration → the one excess finding.
+			expect(where(data)).toEqual(["packages/c/stray.ts"]);
+			// The verdict basename is keyed on the LATEST plan's basename (idempotent).
+			expect(String(data.artifact)).toBe(".rpiv/artifacts/plans/plan-2.md");
+			expect(
+				readFileSync(join(tmpDir, ".rpiv/artifacts/verdicts/implement-scope-check__plan-2.json"), "utf-8"),
+			).toContain("packages/c/stray.ts");
+		});
+
+		it("passes when every dirty path is in the union (latest plan alone would false-fail)", () => {
+			gitInit();
+			const plan1 = writePlan(".rpiv/artifacts/plans/plan-1.md", ["packages/a/x.ts"]);
+			const plan2 = writePlan(".rpiv/artifacts/plans/plan-2.md", ["packages/b/y.ts"]);
+			mkdirSync(join(tmpDir, "packages/a"), { recursive: true });
+			mkdirSync(join(tmpDir, "packages/b"), { recursive: true });
+			writeFileSync(join(tmpDir, "packages/a/x.ts"), "v0");
+			writeFileSync(join(tmpDir, "packages/b/y.ts"), "v0");
+			exec("git", ["add", "-A"]);
+			exec("git", ["commit", "-q", "-m", "baseline"]);
+			writeFileSync(join(tmpDir, "packages/a/x.ts"), "v1"); // declared by plan1 only
+			writeFileSync(join(tmpDir, "packages/b/y.ts"), "v1"); // declared by plan2
+
+			const data = runOn([plan1, plan2]);
+			expect(data.pass).toBe(true);
+			expect(where(data)).toEqual([]);
+		});
+
+		it("degrades to pass in a non-repo cwd (git-missing ⇒ empty dirty, never throws)", () => {
+			const plan = writePlan(".rpiv/artifacts/plans/plan.md", ["packages/a/x.ts"]);
+			const data = runOn([plan]); // tmpDir is NOT a git repo here
+			expect(data.pass).toBe(true);
+			expect(where(data)).toEqual([]);
 		});
 	});
 });
@@ -2175,6 +2544,106 @@ describe("build audit-drop fixes", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Plan-time coverage floor — verifyPhaseFilesCoverage, driven through the public
+// plan-cite-check stage (no direct helper import). A body edit not declared in
+// its phase's `files:` fails the dimension:"structure" verdict; a `files:`-less
+// phase never false-fails (empty-set degradation).
+// ---------------------------------------------------------------------------
+describe("plan-time coverage floor (verifyPhaseFilesCoverage via plan-cite-check)", () => {
+	let tmpDir: string;
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "rpiv-plan-cov-"));
+	});
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	const citeCheckRun = () => {
+		const stage = findWorkflow("build").stages["plan-cite-check"];
+		if (!stage?.run) throw new Error("build plan-cite-check stage has no run function");
+		return stage.run as (ctx: { cwd: string; input?: undefined; state: RunView }) => {
+			data: Record<string, unknown>;
+		};
+	};
+	const write = (rel: string, body: string) => {
+		const parts = rel.split("/");
+		mkdirSync(join(tmpDir, ...parts.slice(0, -1)), { recursive: true });
+		writeFileSync(join(tmpDir, rel), body);
+		return { artifacts: [{ handle: fsHandle(rel) }], data: undefined, kind: "", meta: {} };
+	};
+	const runOn = (plan: ReturnType<typeof write>) =>
+		citeCheckRun()({ cwd: tmpDir, input: undefined, state: { named: { plans: [plan] } } as unknown as RunView }).data;
+	const findingDetails = (data: Record<string, unknown>) =>
+		((data.findings as { detail: string; where: string }[] | undefined) ?? []).map((f) => f.detail).join(" ");
+
+	it("flags an edit path cited in the body but absent from the phase's files:", () => {
+		const rel = ".rpiv/artifacts/plans/p.md";
+		const data = runOn(
+			write(
+				rel,
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: One, files: [] }\n---\n# Plan\n## Phase 1: One\n### Changes\n- \`src/foo.ts\` — add the thing\n`,
+			),
+		);
+		expect(data.dimension).toBe("structure");
+		expect(data.pass).toBe(false);
+		expect(data.findings).toHaveLength(1);
+		expect(findingDetails(data)).toMatch(/src\/foo\.ts/);
+		expect((data.findings as { where: string }[])[0].where).toMatch(/phase 1/);
+	});
+
+	it("passes when every body-cited edit path is listed in files:", () => {
+		const rel = ".rpiv/artifacts/plans/p.md";
+		const data = runOn(
+			write(
+				rel,
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: One, files: ["src/foo.ts"] }\n---\n# Plan\n## Phase 1: One\n### Changes\n- \`src/foo.ts\` — add the thing\n`,
+			),
+		);
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+	});
+
+	it("passes (empty-set degradation) for a files:-less phase — legacy plans never false-fail", () => {
+		const rel = ".rpiv/artifacts/plans/p.md";
+		const data = runOn(
+			write(
+				rel,
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: One }\n---\n# Plan\n## Phase 1: One\n### Changes\n- \`src/foo.ts\` — add the thing\n`,
+			),
+		);
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+	});
+
+	it("ignores paths inside a fenced code block (post-code-splice safety)", () => {
+		const rel = ".rpiv/artifacts/plans/p.md";
+		const data = runOn(
+			write(
+				rel,
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: One, files: [] }\n---\n# Plan\n## Phase 1: One\n### Changes\n- \`src/foo.ts\` — add the thing\n\n\`\`\`ts\n// example fixture — its path must NOT read as a declared write\nimport { x } from "src/fenced-example.ts";\n\`\`\`\n`,
+			),
+		);
+		expect(data.findings).toHaveLength(1);
+		expect(findingDetails(data)).toMatch(/src\/foo\.ts/);
+		expect(findingDetails(data)).not.toMatch(/fenced-example/);
+	});
+
+	it("extracts all three conventions: - `path` (synthesize), #### N. path (blueprint), **File**: (plan)", () => {
+		const rel = ".rpiv/artifacts/plans/p.md";
+		const data = runOn(
+			write(
+				rel,
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: One, files: [] }\n---\n# Plan\n## Phase 1: One\n### Changes\n- \`src/synth-form.ts\` — synthesize list-item form\n#### 1. src/blueprint-form.ts\n**File**: src/plan-form.ts\n`,
+			),
+		);
+		const details = findingDetails(data);
+		expect(details).toMatch(/src\/synth-form\.ts/);
+		expect(details).toMatch(/src\/blueprint-form\.ts/);
+		expect(details).toMatch(/src\/plan-form\.ts/);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // SYNTH_CLUSTER_FANOUT — research threading (finding 4) + fail-loud identity
 // resolution (finding 8).
 // ---------------------------------------------------------------------------
@@ -2875,5 +3344,268 @@ describe("build validate + commit dispatch thread the run-start baseline", () =>
 			state: { named: { goal: [goalAlone] } } as unknown as RunView,
 		});
 		expect(dispatch).toBe("/skill:commit");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// build implement-scope-check (lane-level scope floor) — the deterministic
+// structural backstop beneath the quality gates. Exercises scopeExcess through
+// the implement-scope-check stage's published verdict (no direct helper import:
+// the file exports only builtInWorkflows, as the suite does at line 42).
+// ---------------------------------------------------------------------------
+
+describe("build implement-scope-check (lane-level scope floor)", () => {
+	let tmpDir: string;
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "rpiv-build-scope-"));
+		// The scope-check reads `git status --porcelain` against cwd, so make the
+		// tmpDir a real git repo: an un-tracked file IS a dirty path git reports.
+		// A non-repo cwd degrades to an empty dirty set (pass) — tested separately.
+		execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
+	});
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	const scopeRun = () => {
+		const stage = findWorkflow("build").stages["implement-scope-check"];
+		if (!stage?.run) throw new Error("build implement-scope-check stage has no run function");
+		return stage.run as (ctx: { cwd: string; input?: undefined; state: RunView }) => {
+			data: Record<string, unknown>;
+		};
+	};
+	const out = (rel: string, role?: string) => ({
+		artifacts: role ? [{ handle: fsHandle(rel), role }] : [{ handle: fsHandle(rel) }],
+		data: undefined,
+		kind: "",
+		meta: {},
+	});
+	// Write the plan and the baseline JSON; return the RunView shape the stage reads.
+	const seed = (planRel: string, planBody: string, baselineRel: string, baselinePaths: string[]) => {
+		const parts = planRel.split("/");
+		mkdirSync(join(tmpDir, ...parts.slice(0, -1)), { recursive: true });
+		writeFileSync(join(tmpDir, planRel), planBody);
+		const bparts = baselineRel.split("/");
+		mkdirSync(join(tmpDir, ...bparts.slice(0, -1)), { recursive: true });
+		writeFileSync(join(tmpDir, baselineRel), JSON.stringify({ paths: baselinePaths }, null, 2));
+		return {
+			named: {
+				plans: [out(planRel)],
+				goal: [out(".rpiv/artifacts/goal/goal-t.md"), out(baselineRel, "baseline")],
+			},
+		} as unknown as RunView;
+	};
+	const plan = (filesLines: string[], phaseCount: number) =>
+		`---\nstatus: ready\nphase_count: ${phaseCount}\nphases:\n${filesLines
+			.map((l) => `  - { n: ${phaseCount}, title: P, files: [${l}] }`)
+			.join("\n")}\n---\n## Phase ${phaseCount}: P\n`;
+	// Make `path` dirty so `git status --porcelain` reports it. `git add` the
+	// written file so git reports it at full-path granularity — a fresh `git init`
+	// collapses a wholly-untracked dir to `?? packages/`, but a real repo has a
+	// tracked `packages/` tree so new files report full path. Path-semantic-neutral
+	// for scopeExcess (it keys on the path string, not staged vs unstaged).
+	const dirty = (rel: string) => {
+		const parts = rel.split("/");
+		mkdirSync(join(tmpDir, ...parts.slice(0, -1)), { recursive: true });
+		writeFileSync(join(tmpDir, rel), "x\n");
+		execFileSync("git", ["add", "--", rel], { cwd: tmpDir, stdio: "ignore" });
+	};
+
+	it("passes when every dirty path is declared in the plan's files: union", () => {
+		const state = seed(
+			".rpiv/artifacts/plans/p.md",
+			plan(['"packages/a/foo.ts"'], 1),
+			".rpiv/artifacts/goal/baseline-t.json",
+			[],
+		);
+		dirty("packages/a/foo.ts");
+		const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+		expect(data.dimension).toBe("scope");
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+	});
+
+	it("fails on an undeclared dirty path (the stray write)", () => {
+		const state = seed(
+			".rpiv/artifacts/plans/p.md",
+			plan(['"packages/a/foo.ts"'], 1),
+			".rpiv/artifacts/goal/baseline-t.json",
+			[],
+		);
+		dirty("packages/a/foo.ts"); // declared
+		dirty("packages/a/stray.ts"); // undeclared → excess
+		const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+		expect(data.pass).toBe(false);
+		expect(data.severity).toBe("high");
+		expect(String(data.feedback)).toMatch(/packages\/a\/stray\.ts/);
+		expect(String(data.feedback)).toMatch(/Undeclared write/);
+	});
+
+	it("subtracts run-start baseline paths (pre-existing dirt is not the run's fault)", () => {
+		const state = seed(
+			".rpiv/artifacts/plans/p.md",
+			plan(['"packages/a/foo.ts"'], 1),
+			".rpiv/artifacts/goal/baseline-t.json",
+			["packages/a/pre-existing.ts"],
+		);
+		dirty("packages/a/pre-existing.ts"); // dirty AND in baseline → subtracted
+		const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+	});
+
+	it("subtracts .rpiv/ and thoughts/ bookkeeping paths", () => {
+		const state = seed(
+			".rpiv/artifacts/plans/p.md",
+			plan(['"packages/a/foo.ts"'], 1),
+			".rpiv/artifacts/goal/baseline-t.json",
+			[],
+		);
+		dirty(".rpiv/artifacts/x.json"); // bookkeeping → subtracted
+		dirty("thoughts/y.md"); // bookkeeping → subtracted
+		const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+	});
+
+	it("is inert (pass) for a files:-less plan — empty-declared degradation", () => {
+		// No `files:` key on the phase ⇒ phaseFiles yields [] ⇒ declared=[] ⇒ scopeExcess([]).
+		const state = seed(
+			".rpiv/artifacts/plans/p.md",
+			`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: P }\n---\n## Phase 1: P\n`,
+			".rpiv/artifacts/goal/baseline-t.json",
+			[],
+		);
+		dirty("packages/a/anything.ts"); // would be excess, but declared=[] ⇒ inert
+		const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+	});
+
+	it("writes the verdict to a basename-keyed fs artifact (idempotent across the build loop)", () => {
+		const state = seed(
+			".rpiv/artifacts/plans/p.md",
+			plan(['"packages/a/foo.ts"'], 1),
+			".rpiv/artifacts/goal/baseline-t.json",
+			[],
+		);
+		dirty("packages/a/stray.ts");
+		const result = scopeRun()({ cwd: tmpDir, input: undefined, state });
+		expect(result.data.artifact).toBe(".rpiv/artifacts/plans/p.md");
+		// Basename-keyed off the plan: implement-scope-check__p.json
+		const verdict = JSON.parse(
+			readFileSync(join(tmpDir, ".rpiv/artifacts/verdicts/implement-scope-check__p.json"), "utf-8"),
+		);
+		expect(verdict.dimension).toBe("scope");
+		expect(verdict.pass).toBe(false);
+	});
+
+	it("degrades to pass (empty dirty) when cwd is not a git repo — never throws", () => {
+		const nonRepo = mkdtempSync(join(tmpdir(), "rpiv-build-scope-nongit-"));
+		try {
+			// Write the plan + baseline into the non-repo cwd.
+			const planRel = ".rpiv/artifacts/plans/p.md";
+			const parts = planRel.split("/");
+			mkdirSync(join(nonRepo, ...parts.slice(0, -1)), { recursive: true });
+			writeFileSync(join(nonRepo, planRel), plan(['"packages/a/foo.ts"'], 1));
+			const baselineRel = ".rpiv/artifacts/goal/baseline-t.json";
+			const bparts = baselineRel.split("/");
+			mkdirSync(join(nonRepo, ...bparts.slice(0, -1)), { recursive: true });
+			writeFileSync(join(nonRepo, baselineRel), JSON.stringify({ paths: [] }, null, 2));
+			const state = {
+				named: {
+					plans: [out(planRel)],
+					goal: [out(".rpiv/artifacts/goal/goal-t.md"), out(baselineRel, "baseline")],
+				},
+			} as unknown as RunView;
+			const data = scopeRun()({ cwd: nonRepo, input: undefined, state }).data;
+			expect(data.pass).toBe(true); // empty dirty ⇒ no excess ⇒ pass
+			expect(data.findings).toEqual([]);
+		} finally {
+			rmSync(nonRepo, { recursive: true, force: true });
+		}
+	});
+
+	it("reads the declared union across MULTIPLE phases (not just the first)", () => {
+		// Two phases with disjoint files: unions both into the declared set.
+		const state = seed(
+			".rpiv/artifacts/plans/p.md",
+			`---\nstatus: ready\nphase_count: 2\nphases:\n  - { n: 1, title: A, files: ["packages/a/x.ts"] }\n  - { n: 2, title: B, files: ["packages/b/y.ts"] }\n---\n## Phase 1: A\n## Phase 2: B\n`,
+			".rpiv/artifacts/goal/baseline-t.json",
+			[],
+		);
+		dirty("packages/a/x.ts"); // phase 1's declared write
+		dirty("packages/b/y.ts"); // phase 2's declared write
+		dirty("packages/c/stray.ts"); // declared by NEITHER → excess
+		const data = scopeRun()({ cwd: tmpDir, input: undefined, state }).data;
+		expect(data.pass).toBe(false);
+		expect(String(data.feedback)).toMatch(/packages\/c\/stray\.ts/);
+		expect(String(data.feedback)).not.toMatch(/packages\/a\/x\.ts/);
+		expect(String(data.feedback)).not.toMatch(/packages\/b\/y\.ts/);
+	});
+});
+
+describe("build edges — implement-scope-check sits between implement and validate", () => {
+	const edge = (stage: string): EdgeFn => {
+		const e = findWorkflow("build").edges[stage];
+		if (typeof e !== "function") throw new Error(`build ${stage} edge is not a function`);
+		return e as EdgeFn;
+	};
+	const route = (stage: string, named: Record<string, unknown>): string =>
+		String(
+			edge(stage)({
+				output: undefined,
+				state: { named } as unknown as RunView,
+			}),
+		);
+
+	it("build routes implement → implement-scope-check (no longer straight to validate)", () => {
+		expect(findWorkflow("build").edges.implement).toBe("implement-scope-check");
+	});
+
+	it("build routes implement-scope-check → validate on pass, STOP otherwise (no fallback)", () => {
+		// The `from` form suppresses the READS_DATA lint; a pass verdict routes to
+		// validate, a fail/missing verdict → stop (no fallback). Sourced from the
+		// scope-check's published verdict channel (the stage key for an outcome-less
+		// produces.script, per resolvePublishName).
+		expect(route("implement-scope-check", { "implement-scope-check": [{ data: { verdict: "pass" } }] })).toBe(
+			"validate",
+		);
+		expect(route("implement-scope-check", { "implement-scope-check": [{ data: { verdict: "fail" } }] })).toBe("stop");
+	});
+
+	it("build's stage order lists implement-scope-check between implement and validate", () => {
+		const keys = Object.keys(findWorkflow("build").stages);
+		const i = keys.indexOf("implement");
+		const s = keys.indexOf("implement-scope-check");
+		const v = keys.indexOf("validate");
+		expect(i).toBeGreaterThanOrEqual(0);
+		expect(s).toBe(i + 1);
+		expect(v).toBe(s + 1);
+	});
+
+	it("build's implement references IMPLEMENT_DAG_FANOUT, no longer carries concurrency (unpinned)", () => {
+		const loop = findWorkflow("build").stages.implement?.loop;
+		// Phase 2 rewired build to IMPLEMENT_DAG_FANOUT; Phase 3 deletes concurrency:1.
+		// Both are unexported consts, exercised through the stage loop. Assert the
+		// stage's loop kind is fanout and the DAG closure is distinct from the base
+		// FRONTMATTER_PHASE_FANOUT units (the deps-emitting contract); the absence of
+		// `concurrency` is the unpin (loop-parallel.ts:146 inherits the host cap).
+		expect(loop?.kind).toBe("fanout");
+		if (loop?.kind === "fanout") expect(loop.concurrency).toBeUndefined();
+	});
+
+	it("ship/arch implement still reference IMPLEMENT_PHASE_FANOUT (carries concurrency:1, untouched — vet moved to IMPLEMENT_DAG_FANOUT in the rollout phase)", () => {
+		for (const name of ["ship", "arch"]) {
+			const loop = findWorkflow(name).stages.implement?.loop;
+			expect(loop?.kind, `${name} implement loop kind`).toBe("fanout");
+			if (loop?.kind === "fanout") expect(loop.concurrency, `${name} still pinned at 1`).toBe(1);
+		}
+	});
+
+	it("build still validates clean with the new stage + route (no unreachable stages)", () => {
+		const issues = deriveAndValidate(findWorkflow("build"), { skillContracts: DECLARED_CONTRACTS });
+		expect(issues.filter((i) => /unreachable/.test(i.message))).toEqual([]);
+		expect(issues.filter((i) => i.severity === "error")).toEqual([]);
 	});
 });

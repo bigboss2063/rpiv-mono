@@ -25,6 +25,7 @@ import {
 	defineWorkflow,
 	directoryPathCollector,
 	eq,
+	type FanoutContext,
 	fanin,
 	fanout,
 	gate,
@@ -179,6 +180,45 @@ const latestFsArtifact = (state: RunView, name: string): Artifact | undefined =>
 	state.named[name]?.at(-1)?.artifacts.find((a) => a.handle.kind === "fs");
 
 /**
+ * Read the latest plan published to the named `"plans"` channel and parse its
+ * `phases:` frontmatter into records — the shared read/halt body both
+ * `FRONTMATTER_PHASE_FANOUT` and `IMPLEMENT_DAG_FANOUT` source from. Returns
+ * `null` when no fs plan is published (each caller degrades to `[]`); throws
+ * the two `haltPreflight` diagnostics (plan-not-found, exceeds `MAX_PHASES`)
+ * attributed to `who`. `promptPath` is the plan handle's string form, so each
+ * fanout emits the same `${promptPath} Phase N:` prompt arg.
+ */
+const readPlanPhaseRecords = (
+	state: RunView,
+	cwd: string,
+	who: string,
+): { records: readonly PhaseRecord[]; promptPath: string } | null => {
+	const plan = latestFsArtifact(state, "plans");
+	if (plan?.handle.kind !== "fs") return null;
+	const path = plan.handle.path;
+	let content: string;
+	try {
+		content = readArtifactFile(path, cwd);
+	} catch (err) {
+		throw haltPreflight(
+			who,
+			`${who}: plan file not found`,
+			`${who}: could not read ${path} — ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	const records = planPhaseRecords(content, who, path);
+	if (records.length > MAX_PHASES) {
+		throw haltPreflight(
+			who,
+			`${who}: plan ${path} exceeds phase limit`,
+			`${who}: plan ${path} declares ${records.length} phases — exceeds MAX_PHASES (${MAX_PHASES}); split into smaller plans`,
+		);
+	}
+	const promptPath = handleToString(plan.handle);
+	return { records, promptPath };
+};
+
+/**
  * Fan `implement` out over the structured `phases:` frontmatter array of the
  * latest plan published to the named `"plans"` channel. Sourcing from the named
  * channel (not the rolling primary) makes the stage's `reads: ["plans"]`
@@ -191,28 +231,9 @@ const FRONTMATTER_PHASE_FANOUT = fanout({
 	unit: { by: "frontmatter-array", pattern: "phases" },
 	max: MAX_PHASES,
 	units: ({ state, cwd }) => {
-		const plan = latestFsArtifact(state, "plans");
-		if (plan?.handle.kind !== "fs") return [];
-		const path = plan.handle.path;
-		let content: string;
-		try {
-			content = readArtifactFile(path, cwd);
-		} catch (err) {
-			throw haltPreflight(
-				"FRONTMATTER_PHASE_FANOUT",
-				`FRONTMATTER_PHASE_FANOUT: plan file not found`,
-				`FRONTMATTER_PHASE_FANOUT: could not read ${path} — ${err instanceof Error ? err.message : String(err)}`,
-			);
-		}
-		const records = planPhaseRecords(content, "FRONTMATTER_PHASE_FANOUT", path);
-		if (records.length > MAX_PHASES) {
-			throw haltPreflight(
-				"FRONTMATTER_PHASE_FANOUT",
-				`FRONTMATTER_PHASE_FANOUT: plan ${path} exceeds phase limit`,
-				`FRONTMATTER_PHASE_FANOUT: plan ${path} declares ${records.length} phases — exceeds MAX_PHASES (${MAX_PHASES}); split into smaller plans`,
-			);
-		}
-		const promptPath = handleToString(plan.handle);
+		const read = readPlanPhaseRecords(state, cwd, "FRONTMATTER_PHASE_FANOUT");
+		if (!read) return [];
+		const { records, promptPath } = read;
 		return records.map((r) => ({
 			prompt: `${promptPath} Phase ${r.n}: ${r.title}`.trimEnd(),
 			label: `phase ${r.index + 1}/${r.total}`,
@@ -221,15 +242,87 @@ const FRONTMATTER_PHASE_FANOUT = fanout({
 });
 
 /**
- * `implement`'s serial twin of `FRONTMATTER_PHASE_FANOUT`. Applying a plan to ONE
- * working tree is a patch-series / migration: phases share files (a later phase
- * EDITS a file an earlier phase CREATES) and mutate shared state, so running them
- * in parallel races on those files and lets a dependent phase run before its
- * prerequisite has landed. `concurrency: 1` serializes the units in the plan's
- * (topological) phase order — same units, no race, prerequisites always present.
- * `elaborate` keeps the parallel fanout: it writes ISOLATED per-phase docs.
+ * `implement`'s serial twin of `FRONTMATTER_PHASE_FANOUT`, for plans that do NOT
+ * declare a per-phase write set. `concurrency: 1` serializes the units in the
+ * plan's (topological) phase order — the safe model when a fanout's units share a
+ * working tree AND their write-sets are unknown (so the scheduler cannot derive
+ * dep edges and the lane has no scope floor to guard it). `elaborate` keeps the
+ * parallel fanout: it writes ISOLATED per-phase docs.
+ *
+ * When a plan DOES declare per-phase `files:`, prefer `IMPLEMENT_DAG_FANOUT`:
+ * its `implementPhaseDeps` derives dep edges from write-set overlap (units with
+ * disjoint `files:` run concurrently; a `files:`-less phase conflicts with every
+ * lower phase, degrading to the full chain — one phase per wave — so the
+ * all-`files:`-less plan stays serial at any cap), and a lane-level scope floor
+ * guards the declared set. Used today by ship/arch (vet moves to the DAG variant
+ * once it carries `files:`); `IMPLEMENT_DAG_FANOUT`'s `concurrency: 1` is dropped
+ * once build's scope floor lands.
  */
 const IMPLEMENT_PHASE_FANOUT = { ...FRONTMATTER_PHASE_FANOUT, concurrency: 1 };
+
+/**
+ * Derive the directed `deps` edges for ONE implement phase under the dep-gated
+ * DAG fanout (`IMPLEMENT_DAG_FANOUT`). Edges point strictly downward (toward
+ * LOWER phase numbers), so the graph is acyclic by construction. Two clauses:
+ *
+ *  - clause A (self declares a `files:` write-set): `self` depends on every
+ *    LOWER phase whose declared `files:` shares ≥1 entry, UNIONED with `self`'s
+ *    explicit `depends_on` (semantic ordering not visible in `files:`).
+ *  - clause B (self declares NO `files:`): `self` conflicts with EVERY lower
+ *    phase → full chain (a write-set-less phase's writes are unknown, so it
+ *    cannot be proven independent of anything below it). This is the
+ *    empty-set degradation that keeps a legacy / `files:`-less plan serial at
+ *    any cap (one phase per Kahn wave).
+ *
+ * Returns `phase-<n>` unit ids, sorted ascending. Reads `phaseFiles`
+ * and `phaseDeps` (`packages/rpiv-pi/extensions/rpiv-core/built-in-workflows.ts:373`)
+ * — both defined later textually, but only inside this runtime closure, so no
+ * TDZ (same pattern as `sliceDeps` at `:747`).
+ */
+const implementPhaseDeps = (records: readonly PhaseRecord[], self: PhaseRecord): string[] => {
+	const selfFiles = phaseFiles(self.entry);
+	const explicit = phaseDeps(self.entry);
+	const ns = new Set<number>();
+	for (const e of explicit) if (e < self.n) ns.add(e);
+	if (selfFiles.length === 0) {
+		// clause B — unknown write-set ⇒ conflict with every lower phase.
+		for (const r of records) if (r.n < self.n) ns.add(r.n);
+	} else {
+		// clause A — overlap on ≥1 declared write path.
+		for (const r of records) {
+			if (r.n >= self.n) continue;
+			const rFiles = phaseFiles(r.entry);
+			if (rFiles.some((f) => selfFiles.includes(f))) ns.add(r.n);
+		}
+	}
+	return [...ns].sort((a, b) => a - b).map((n) => `phase-${n}`);
+};
+
+/**
+ * Dep-gated DAG variant of `FRONTMATTER_PHASE_FANOUT` — `implement`'s twin that
+ * emits per-phase `id`/`deps` edges so the wave scheduler orders phases by their
+ * declared write-set overlap + explicit `depends_on`. The spread idiom inherits
+ * `source`/`unit`/`max`/`onCap`/`result`/`kind` verbatim from the base; the new
+ * `units` closure emits the SAME `prompt`/`label` strings AND adds
+ * `id: \`phase-${r.n}\`` + `deps: implementPhaseDeps(records, r)`. NO
+ * `depArtifactFlag` — implement phases feed each other through the working tree
+ * (not published artifacts), so `deps` drive ONLY wave ordering. `concurrency: 1`
+ * keeps it serial/inert here; Phase 3 deletes it to inherit the host cap.
+ */
+const IMPLEMENT_DAG_FANOUT = {
+	...FRONTMATTER_PHASE_FANOUT,
+	units: ({ state, cwd }: FanoutContext) => {
+		const read = readPlanPhaseRecords(state, cwd, "IMPLEMENT_DAG_FANOUT");
+		if (!read) return [];
+		const { records, promptPath } = read;
+		return records.map((r) => ({
+			prompt: `${promptPath} Phase ${r.n}: ${r.title}`.trimEnd(),
+			label: `phase ${r.index + 1}/${r.total}`,
+			id: `phase-${r.n}`,
+			deps: implementPhaseDeps(records, r),
+		}));
+	},
+};
 
 // ===========================================================================
 // ship — blueprint → implement → validate → commit
@@ -292,41 +385,6 @@ const archWorkflow = defineWorkflow({
 });
 
 // ===========================================================================
-// vet — code-review → (blueprint → implement → validate → loop) | commit
-//       Examine existing changes; if not approved, blueprint a fix plan,
-//       implement it, validate, and re-review. Loops until approved.
-// ===========================================================================
-
-const vetWorkflow = defineWorkflow({
-	name: "vet",
-	description:
-		"Examine existing changes for approval; loop a fix cycle if not approved. Best when a diff already exists (yours or a teammate's) and you want a structured review with optional repair. Chain: code-review → (blueprint → implement → validate → loop) → commit.",
-	start: "code-review",
-	stages: {
-		"code-review": produces(),
-		blueprint: produces(),
-		implement: acts({ loop: IMPLEMENT_PHASE_FANOUT, reads: ["plans"] }),
-		validate: produces(),
-		commit: acts({ outcome: gitCommitOutcome }),
-	},
-	edges: {
-		// Same numeric gate as build/arch/polish: zero remaining blockers →
-		// commit; any blockers → loop a fix pass through blueprint. The
-		// `blockers_count` field is sourced + validated from the code-review
-		// contract (`produces.data`, required), so a missing field fails
-		// output validation rather than silently routing.
-		"code-review": gate("blockers_count", { blueprint: gt(0), commit: eq(0) }, "commit"),
-		blueprint: "implement",
-		implement: "validate",
-		// Backward edge: validate → code-review creates the review-fix loop.
-		// Bounded by the runner's default maxBackwardJumps (2), permitting at
-		// most 3 review iterations (initial + 2 retries) before the guard halts.
-		validate: "code-review",
-		commit: "stop",
-	},
-});
-
-// ===========================================================================
 // polish — architecture-review → blueprint (iterate, per review phase) →
 //          implement → validate → code-review → (blueprint loop) | commit
 //          For a large architecture review that can't be planned in one pass:
@@ -373,6 +431,17 @@ const phaseNum = (entry: unknown, index: number): number => {
 const phaseDeps = (entry: unknown): number[] => {
 	const raw = (entry as { depends_on?: unknown } | undefined)?.depends_on;
 	return Array.isArray(raw) ? raw.filter((d): d is number => typeof d === "number") : [];
+};
+
+/** The repo-root-relative paths a phase entry declares it creates/edits (its
+ *  `files:` array — `[]` when absent). The open-schema twin of `phaseDeps`,
+ *  read straight off `PhaseRecord.entry` so `planPhaseRecords` preserves the new
+ *  key unchanged. Consumed by the plan-time coverage floor
+ *  (`verifyPhaseFilesCoverage`) and, in a later phase, the dep-gated implement
+ *  fanout (`implementPhaseDeps`). */
+const phaseFiles = (entry: unknown): string[] => {
+	const raw = (entry as { files?: unknown } | undefined)?.files;
+	return Array.isArray(raw) ? raw.filter((f): f is string => typeof f === "string") : [];
 };
 
 /**
@@ -652,6 +721,20 @@ const captureGoal = ({ state, cwd }: ScriptContext): Omit<Output, "meta"> => {
 	};
 };
 
+/** Parse `git status --porcelain`/`--short` output into dirty paths. Strips the
+ *  2-char `XY` status prefix and resolves rename targets (`XY old -> new` → `new`),
+ *  so the two output forms (`--porcelain`, `--short`) normalize identically. A
+ *  porcelain line is always `XY <path>` or `XY <old> -> <new>`; blank lines drop. */
+const parseGitStatusPaths = (out: string): string[] =>
+	out
+		.split("\n")
+		.filter((l) => l.trim() !== "")
+		.map((l) => {
+			const rest = l.slice(3).trim();
+			const arrow = rest.indexOf(" -> ");
+			return arrow >= 0 ? rest.slice(arrow + 4).trim() : rest;
+		});
+
 /** Record the paths dirty before the run to `rel` (best-effort; empty on any git failure). */
 const writeCommitBaseline = (cwd: string, rel: string): void => {
 	let paths: string[] = [];
@@ -664,14 +747,7 @@ const writeCommitBaseline = (cwd: string, rel: string): void => {
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],
 		});
-		paths = out
-			.split("\n")
-			.filter((l) => l.trim() !== "")
-			.map((l) => {
-				const rest = l.slice(3).trim();
-				const arrow = rest.indexOf(" -> ");
-				return arrow >= 0 ? rest.slice(arrow + 4).trim() : rest;
-			});
+		paths = parseGitStatusPaths(out);
 	} catch {
 		paths = [];
 	}
@@ -683,6 +759,47 @@ const writeCommitBaseline = (cwd: string, rel: string): void => {
 const goalBaselinePath = (state: RunView): string | undefined => {
 	const a = state.named.goal?.at(-1)?.artifacts.find((x) => x.role === "baseline" && x.handle.kind === "fs");
 	return a ? handleToString(a.handle) : undefined;
+};
+
+/** Paths under these run-bookkeeping trees are NEVER a scope violation — the run
+ *  legitimately writes its artifacts/notes/trails here regardless of phase scope. */
+const SCOPE_BOOKKEEPING_DIRS: ReadonlySet<string> = new Set([".rpiv", "thoughts"]);
+
+/**
+ * The lane-level scope floor's pure core. Returns the dirty paths that are NOT
+ * explained by the run's declared write-set: a path is excess when it is outside
+ * `declared`, was NOT dirty at the run-start `baseline`, and is NOT under a
+ * bookkeeping tree (`.rpiv/`, `thoughts/`). The `implement` lane declared-set is
+ * the union of its plan's per-phase `files:`; `validate`'s whole-repo
+ * build/test writes are owned by a later stage, never by a phase.
+ *
+ * Empty `declared` ⇒ `[]` (degradation): a `files:`-less plan is serial-by-
+ * construction under the DAG fanout's missing-`files:` clause (full dep chain ⇒
+ * one phase per wave), so there is no concurrent sibling to corrupt and nothing
+ * to guard — the floor returns no excess and never false-fails a legacy plan.
+ * `validate`'s whole-repo writes are out of scope here regardless: they belong
+ * to `validate`, which runs AFTER this gate, so the lane's dirty set never
+ * carries them at the scope-check's read time.
+ *
+ * This is deliberately LANE-level, not per-phase: under concurrency, a dirty
+ * path cannot be attributed to the specific phase that wrote it, so per-phase
+ * enforcement would be unsound. The per-phase discipline is enforced upstream
+ * by the plan-authoring write-scope rule + the plan-time coverage floor;
+ * this lane floor is the structural backstop that catches a phase that escaped
+ * upstream discipline. Returns one entry per excess path.
+ */
+const scopeExcess = (dirty: readonly string[], baseline: readonly string[], declared: readonly string[]): string[] => {
+	if (declared.length === 0) return [];
+	const declaredSet = new Set(declared);
+	const baselineSet = new Set(baseline);
+	const excess: string[] = [];
+	for (const path of dirty) {
+		if (declaredSet.has(path) || baselineSet.has(path)) continue;
+		const top = path.split("/")[0];
+		if (SCOPE_BOOKKEEPING_DIRS.has(top)) continue;
+		excess.push(path);
+	}
+	return excess;
 };
 
 /**
@@ -1181,6 +1298,158 @@ const sliceStructureCheck = ({ state, cwd }: ScriptContext): Omit<Output, "meta"
 };
 
 /**
+ * Slice a plan body into per-phase text keyed by phase number, splitting on
+ * `## Phase N:` headings OUTSIDE fenced code blocks (a heading inside a ``` or
+ * ~~~ fence is example/fixture text, not a structural phase boundary — mirrors
+ * `countHeadingsOutsideFences` so the slice and the derive-check agree). The
+ * body for phase N runs from its heading line up to (not including) the next
+ * out-of-fence `## Phase M:` heading, or end-of-text for the last phase.
+ * Returns a `Map<number, string>` (phase n → body text, heading included).
+ */
+const phaseBodySlices = (content: string): Map<number, string> => {
+	const lineRe = new RegExp(PLAN_PHASE_RE.source); // drop g/m; per-line test, lastIndex can't drift
+	const lines = content.split("\n");
+	let inFence = false;
+	let fenceLen = 0;
+	const openings: { n: number; start: number }[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const fence = /^\s*(`{3,}|~{3,})/.exec(line);
+		if (fence) {
+			const len = fence[1].length;
+			if (!inFence) {
+				inFence = true;
+				fenceLen = len;
+			} else if (len >= fenceLen && line.trim().length === len) {
+				inFence = false;
+				fenceLen = 0;
+			}
+			continue;
+		}
+		if (!inFence) {
+			const m = lineRe.exec(line);
+			if (m?.[1]) openings.push({ n: Number(m[1]), start: i });
+		}
+	}
+	const slices = new Map<number, string>();
+	for (let idx = 0; idx < openings.length; idx++) {
+		const end = idx + 1 < openings.length ? openings[idx + 1].start : lines.length;
+		slices.set(openings[idx].n, lines.slice(openings[idx].start, end).join("\n"));
+	}
+	return slices;
+};
+
+/** Strip a trailing `:line` or `:line-line` citation suffix from a path token. */
+const stripLineSuffix = (p: string): string => p.replace(/:\d+(?:-\d+)?$/, "");
+
+/** Path-like test mirroring slice-overlap.mjs's `looksLikePath`, applied AFTER
+ *  stripping a `:line` suffix (the blueprint MODIFY heading — `#### N. path/to/file.ext`
+ *  with a `:12-30` range appended — carries a line range the bare form rejects). */
+const isPathLike = (s: string): boolean =>
+	/\.[A-Za-z0-9]+$/.test(s) && (s.includes("/") || /^[\w.-]+\.[A-Za-z0-9]+$/.test(s));
+
+/**
+ * Extract the edit paths a phase body names, across the three artifact
+ * conventions the plan/blueprint/synthesize skills emit, OUTSIDE fenced code
+ * blocks (a path inside a ``` fence is a code reference, not a declared write —
+ * post-`code-splice` safety, since code-splice folds elaborations' fenced code
+ * into the plan and those fenced paths must NOT read as phase writes):
+ *   • `**File**:` / `**Files**:` — plan/blueprint's per-change file line
+ *     (a backticked comma-list under `**Files**:`, or a single path under `**File**:`).
+ *   • `#### N. path/to/file.ext` — blueprint's change subsection heading
+ *     (may carry a `:line`-range suffix on MODIFY entries — stripped).
+ *   • `- `path/to/file.ts`` — synthesize's backticked-path list item under
+ *     `### Changes` (the form `elaborate`/`synthesize` emit).
+ * Strips a trailing `:line`/`:line-line` suffix. Mirrors slice-overlap.mjs's
+ * `filesOf` + `looksLikePath` and extends them with the synthesize list-item
+ * form. Returns a de-duplicated `string[]`.
+ */
+const editPathsOfPhase = (phaseBody: string): string[] => {
+	const files = new Set<string>();
+	const add = (raw: string) => {
+		const stripped = stripLineSuffix(raw.replace(/[`*]/g, "").trim());
+		if (stripped && isPathLike(stripped)) files.add(stripped);
+	};
+	let inFence = false;
+	let fenceLen = 0;
+	for (const line of phaseBody.split("\n")) {
+		const fence = /^\s*(`{3,}|~{3,})/.exec(line);
+		if (fence) {
+			const len = fence[1].length;
+			if (!inFence) {
+				inFence = true;
+				fenceLen = len;
+			} else if (len >= fenceLen && line.trim().length === len) {
+				inFence = false;
+				fenceLen = 0;
+			}
+			continue;
+		}
+		if (inFence) continue;
+		const fm = line.match(/^\*\*Files?\*\*:\s*(.+)$/);
+		if (fm) {
+			for (const tok of fm[1].split(/[,\s]+/)) add(tok);
+			continue;
+		}
+		const hm = line.match(/^#{3,4}\s+\d+\.\s+(\S+)/);
+		if (hm) {
+			add(hm[1]);
+			continue;
+		}
+		const lm = line.match(/^-\s+`([^`]+)`/);
+		if (lm) add(lm[1]);
+	}
+	return [...files];
+};
+
+/**
+ * Deterministic plan-time coverage floor: every edit path a phase body NAMES
+ * (in `### Changes`/`#### N. path`/`**File**:`) must be DECLARED in that phase's
+ * frontmatter `files:` array. An undeclared write is the per-phase attribution
+ * gap the dep-gated implement fanout and the lane-level scope floor both need
+ * closed upstream — a body edit not in `files:` is invisible to dependency
+ * derivation and unattributable under concurrency. PURE: no LLM judgment, never
+ * throws (a malformed frontmatter degrades to `[]`). A `files:`-LESS phase
+ * (absent key) yields NO findings — empty-set degradation so a legacy/
+ * `files:`-less plan never false-fails; a phase that declares `files: []` is
+ * checked (every body edit is a gap). Folded into `planCitationCheck(who)` so
+ * both the `plan-cite-check` and `code-cite-check` arms emit coverage findings
+ * on their shared `dimension: "structure"` verdict — no new stage/channel/route.
+ */
+const verifyPhaseFilesCoverage = (content: string, who: string, path: string): { detail: string; where: string }[] => {
+	let fm: Record<string, unknown>;
+	try {
+		const { frontmatter } = parseFrontmatter(content);
+		fm = frontmatter as Record<string, unknown>;
+	} catch {
+		return []; // malformed frontmatter → degrade to no findings, never throw
+	}
+	const phases = Array.isArray(fm.phases) ? fm.phases : [];
+	const entryByN = new Map<number, Record<string, unknown>>();
+	phases.forEach((entry, idx) => {
+		const e = (entry ?? {}) as Record<string, unknown>;
+		const n = typeof e.n === "number" ? e.n : idx + 1;
+		entryByN.set(n, e);
+	});
+	const findings: { detail: string; where: string }[] = [];
+	for (const [n, body] of phaseBodySlices(content)) {
+		const entry = entryByN.get(n);
+		if (!entry) continue; // body phase with no matching frontmatter entry — derive-check's concern, not coverage's
+		// `files:` key ABSENT → degradation (legacy plan): skip. Present (even `[]`) → check.
+		if (!Array.isArray(entry.files)) continue;
+		const declared = new Set(phaseFiles(entry));
+		for (const editPath of editPathsOfPhase(body)) {
+			if (declared.has(editPath)) continue;
+			findings.push({
+				detail: `Phase ${n} names edit path ${editPath} in its body but does not declare it in its frontmatter 'files:' array. Every path a phase creates or edits must be listed in 'files:' (repo-root-relative, never a bare basename) so the plan-time coverage floor and the dep-gated implement fanout see the phase's full write set. Add ${editPath} to phase ${n}'s 'files:' array, or drop the body reference if the write belongs to another phase.`,
+				where: `${who} ${path} phase ${n}: ${editPath}`,
+			});
+		}
+	}
+	return findings;
+};
+
+/**
  * Deterministic citation floor for a synthesized/spliced plan — the plan-scope
  * twin of `sliceStructureCheck`'s citation backing, extending finding 6 past the
  * slice map to the plan and the code-bearing plan (a fabricated `file:line` in
@@ -1204,6 +1473,9 @@ const planCitationCheck =
 		}
 		const body = readArtifactFile(latest.handle.path, cwd);
 		const findings = verifyCitations(body, cwd);
+		// Plan-time coverage floor: a body edit not declared in its phase's `files:`
+		// fails structurally, same channel/verdict/route as an unbacked citation.
+		findings.push(...verifyPhaseFilesCoverage(body, who, latest.handle.path));
 		const pass = findings.length === 0;
 		const data = {
 			dimension: "structure",
@@ -1219,6 +1491,234 @@ const planCitationCheck =
 		writeFileSync(join(cwd, rel), JSON.stringify(data, null, 2), "utf-8");
 		return { kind: "json", artifacts: [{ handle: { kind: "fs", path: rel } }], data };
 	};
+
+/**
+ * Deterministic lane-level scope floor — the structural backstop beneath the
+ * LLM quality gates. After build's `implement` lane runs (now dep-gated and, as
+ * of this phase's unpin, concurrent up to the host cap), this checks the working
+ * tree's dirty set against the plan's declared write-set (the union of every
+ * phase's `files:`): any dirty path the run wrote that is NOT in `declared`, NOT
+ * pre-existing at the run-start baseline, and NOT under a bookkeeping tree is a
+ * scope violation — a phase escaped the upstream write-scope discipline and
+ * rewrote the wider tree, corrupting (or about to corrupt) a concurrent
+ * sibling's in-flight edit. Fail ⇒ STOP (no fix arm): a scope violation is a
+ * plan-vs-tree drift the agent must reconcile manually, not an auto-fix loop.
+ *
+ * Reads the plan with the SAME inline shape `planCitationCheck(who)` uses —
+ * `latestFsArtifact(state,"plans")` + `readArtifactFile` + `planPhaseRecords` +
+ * Phase 1's `phaseFiles` — NOT Phase 2's `readPlanPhaseRecords(state,cwd,who)`,
+ * because this stage needs the plan HANDLE for the `artifact` field and the
+ * basename-keyed verdict path, which the `who`-attributed helper collapses. The
+ * baseline is the run-start snapshot on the `goal` channel (`goalBaselinePath`,
+ * the same reader `VALIDATE_GOAL_PROMPT` and `COMMIT_BASELINE_PROMPT` use); the
+ * dirty set is `git status --porcelain` (non-repo / git-missing ⇒ empty dirty ⇒
+ * pass — the lane degrades to unguarded rather than failing a non-repo run).
+ * Emits one `{ dimension: "scope" }` verdict, basename-keyed off the plan ⇒
+ * idempotent across the build loop.
+ *
+ * `data` carries BOTH a `pass` boolean AND a `verdict` enum ("pass" | "fail")
+ * that always agree (`verdict: pass ? "pass" : "fail"`). The route is the
+ * established `match("verdict", …)` gate idiom (mirrors `validate`'s own route:
+ * `match("verdict", { commit: "pass" }, …)` — no-match ⇒ STOP, the same fail
+ * behavior). It is deliberately NOT the `defineRoute`/`allDimensionsPass`
+ * pattern the citation floors use: `allDimensionsPass` applies a severity floor
+ * (pass === true || severity low/none), so a failing scope check rated low
+ * severity would silently pass the gate — the exact escape class the lane floor
+ * exists to catch. The `from` form suppresses the `READS_DATA` outputSchema lint,
+ * so no schema is declared on the script stage (matching `slice-check`/
+ * `plan-cite-check`).
+ */
+const implementScopeCheck = ({ state, cwd }: ScriptContext): Omit<Output, "meta"> => {
+	const latest = latestFsArtifact(state, "plans");
+	if (latest?.handle.kind !== "fs") {
+		throw haltPreflight(
+			"implement-scope-check",
+			"implement-scope-check: no plan to scope-check",
+			"implement-scope-check: no fs artifact on the 'plans' channel — implement must run before the scope check",
+		);
+	}
+	const body = readArtifactFile(latest.handle.path, cwd);
+	const records = planPhaseRecords(body, "implement-scope-check", latest.handle.path);
+	// Declared write-set = union of every phase's `files:` (via `phaseFiles`).
+	// A `files:`-less plan yields `[]` ⇒ `scopeExcess` returns `[]` ⇒ inert floor.
+	const declared = records.flatMap((r) => phaseFiles(r.entry));
+
+	// Run-start baseline: the pre-existing-dirty snapshot on the goal channel
+	// (same reader VALIDATE_GOAL_PROMPT / COMMIT_BASELINE_PROMPT use). Best-effort:
+	// absent (no goal stage / unreadable) ⇒ empty baseline ⇒ nothing subtracted.
+	const baselinePath = goalBaselinePath(state);
+	let baseline: string[] = [];
+	if (baselinePath) {
+		try {
+			const parsed = JSON.parse(readArtifactFile(baselinePath, cwd)) as { paths?: unknown };
+			const p = parsed.paths;
+			baseline = Array.isArray(p) ? p.filter((x): x is string => typeof x === "string") : [];
+		} catch {
+			baseline = [];
+		}
+	}
+
+	// Current dirty set. Non-repo / git-unavailable ⇒ empty (pass) — never throws.
+	// stdio: stderr ignored — git's "fatal: not a git repository" leaks to the
+	// parent's stderr even though the catch treats it as a supported silent degrade.
+	let dirty: string[] = [];
+	try {
+		const out = execFileSync("git", ["status", "--porcelain"], {
+			cwd,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		dirty = parseGitStatusPaths(out);
+	} catch {
+		dirty = [];
+	}
+
+	const excess = scopeExcess(dirty, baseline, declared);
+	const findings = excess.map((path) => ({
+		detail: `Undeclared write ${path} — the working tree is dirty outside the plan's declared write-set (the union of every phase's 'files:'). The implement lane runs sibling phases concurrently in one tree, so a phase that wrote outside its 'files:' has stepped on (or is about to step on) a sibling's in-flight edit. Reconcile the phase's 'files:' with what it actually writes, or move the write into the owning phase.`,
+		where: path,
+	}));
+	const pass = findings.length === 0;
+	const data = {
+		dimension: "scope",
+		pass,
+		verdict: pass ? "pass" : "fail",
+		score: pass ? 100 : 0,
+		severity: pass ? "none" : "high",
+		artifact: handleToString(latest.handle),
+		findings,
+		feedback: pass ? "" : findings.map((f) => f.detail).join(" "),
+	};
+	const rel = join(VERDICT_DIR, `implement-scope-check__${basename(latest.handle.path, ".md")}.json`);
+	mkdirSync(join(cwd, VERDICT_DIR), { recursive: true });
+	writeFileSync(join(cwd, rel), JSON.stringify(data, null, 2), "utf-8");
+	return { kind: "json", artifacts: [{ handle: { kind: "fs", path: rel } }], data };
+};
+
+/**
+ * vet's `implement-scope-check` — the loop-aware scope floor (twin of build's
+ * `implementScopeCheck` above). Deterministic (no LLM): the implement lane may
+ * write ONLY the paths a plan phase declares in its `files:` set; any other dirty
+ * path (not in the run-start baseline, not under `.rpiv/`/`thoughts/`) is excess
+ * and halts before `validate`.
+ *
+ * vet differs from build in ONE place: build's extra `plans` entries are
+ * superseding amendments (`plan-fix` re-publishes the whole plan) so build reads
+ * latest-only; vet's review-fix loop pushes a DISTINCT non-superseding fix plan
+ * per iteration (completing a `produces` stage APPENDS to its named slot, and
+ * backward jumps don't reset channels), so this function builds `declared` as the
+ * UNION of Phase 1's `phaseFiles` over the FULL `state.named.plans` history — a
+ * path a prior iteration's plan legitimately wrote is not excess against the
+ * latest plan. The latest plan's handle is used ONLY for the basename-keyed
+ * verdict path (idempotent across fix rounds) and the `artifact` field.
+ *
+ * Otherwise byte-for-byte `implementScopeCheck` above: the baseline via
+ * `goalBaselinePath` (satisfied now that vet has a `goal` stage), the dirty set
+ * via `git status --porcelain` with explicit `stdio`, the shared `scopeExcess`
+ * core + `parseGitStatusPaths`, and the `dimension:"scope"` verdict
+ * (carrying BOTH `pass` and `verdict` — the route is the `match("verdict", …)`
+ * gate idiom, NOT `allDimensionsPass`, so a fail always halts) written to
+ * `VERDICT_DIR`. Non-repo / git-missing ⇒ empty dirty ⇒ pass (never throws).
+ * Basename-keyed off the latest plan ⇒ idempotent across review-fix rounds.
+ */
+const implementScopeCheckVet = ({ state, cwd }: ScriptContext): Omit<Output, "meta"> => {
+	// Declared set = UNION of `phaseFiles` over EVERY non-failed plan on the channel.
+	// The fs-artifact filter skips failed/unfilled entries (an Output with no fs
+	// handle contributed no plan to read).
+	const plans = state.named.plans ?? [];
+	const declared = new Set<string>();
+	// Narrowed Artifact whose handle is the `fs` variant, so the loop's
+	// `if (a.handle.kind !== "fs") continue` narrowing carries to the post-loop
+	// `latest.handle.path` read (the file's idiom — `designPathsBySlice` reads
+	// `.path` inside its own same-scope guard; this loop captures the artifact
+	// ACROSS iterations, so the narrowed type annotates the capture).
+	type FsArtifact = Artifact & { handle: { kind: "fs"; path: string } };
+	let latest: FsArtifact | undefined;
+	for (const out of plans) {
+		// Per plan, capture its FIRST fs artifact as the `latest` candidate so the
+		// LAST plan with an fs artifact wins (mirrors `latestFsArtifact`'s
+		// `.at(-1)?.artifacts.find(kind==="fs")` — last channel entry, first fs
+		// artifact in it — which keys the verdict path + `artifact` field).
+		let firstFsInPlan: FsArtifact | undefined;
+		for (const a of out.artifacts) {
+			if (a.handle.kind !== "fs") continue; // fs-artifact filter
+			if (!firstFsInPlan) firstFsInPlan = a as FsArtifact;
+			const path = a.handle.path;
+			try {
+				const content = readArtifactFile(path, cwd);
+				for (const r of planPhaseRecords(content, "implement-scope-check", path)) {
+					for (const f of phaseFiles(r.entry)) declared.add(f);
+				}
+			} catch {
+				// Unreadable/unparseable plan: don't widen the declared set on error —
+				// the union stays the sum of the parseable plans. (A plan so malformed
+				// it can't be parsed is a `plan-cite-check`/`plan-fix` concern, not scope.)
+			}
+		}
+		if (firstFsInPlan) latest = firstFsInPlan;
+	}
+	if (!latest) {
+		throw haltPreflight(
+			"implement-scope-check",
+			"implement-scope-check: no plan to check",
+			"implement-scope-check: no fs plan artifact on the 'plans' channel — blueprint/implement must run before the scope check",
+		);
+	}
+
+	// Baseline: the run-start pre-existing-dirty snapshot riding the goal channel
+	// (role "baseline"), now published by vet's `goal` stage. Read its { paths } to
+	// subtract paths the run did not touch.
+	const baselinePath = goalBaselinePath(state);
+	let baseline: string[] = [];
+	if (baselinePath) {
+		try {
+			const parsed = JSON.parse(readArtifactFile(baselinePath, cwd)) as { paths?: unknown };
+			baseline = Array.isArray(parsed.paths) ? parsed.paths.filter((p): p is string => typeof p === "string") : [];
+		} catch {
+			baseline = []; // missing/unreadable baseline ⇒ degrade to baseline-less
+		}
+	}
+
+	// Dirty set via `git status --porcelain` (rename targets resolved by the shared
+	// parser). stdio: stderr ignored — git's "fatal: not a git repository" leaks to
+	// the parent's stderr even though the catch treats it as a supported silent
+	// degrade (best-effort: non-repo / git-missing ⇒ empty dirty ⇒ pass).
+	let dirty: string[] = [];
+	try {
+		const out = execFileSync("git", ["status", "--porcelain"], {
+			cwd,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		dirty = parseGitStatusPaths(out);
+	} catch {
+		dirty = [];
+	}
+
+	// Phase 3's shared core: subtract the run's bookkeeping dirs (`.rpiv/`,
+	// `thoughts/`) and the run-start baseline; empty-`declared` ⇒ `[]` (degradation
+	// ⇒ inert floor — a fully `files:`-less plan never false-fails).
+	const excess = scopeExcess(dirty, baseline, [...declared]);
+	const findings = excess.map((p) => ({
+		detail: `${p}: written by the implement lane but not declared in any plan iteration's \`files:\` set. A phase may write only its declared paths (the write-scope rule); declare the path in the owning phase's \`files:\` or drop the write.`,
+		where: p,
+	}));
+	const pass = findings.length === 0;
+	const data = {
+		dimension: "scope",
+		pass,
+		verdict: pass ? "pass" : "fail",
+		score: pass ? 100 : 0,
+		severity: pass ? "none" : "high",
+		artifact: handleToString(latest.handle),
+		findings,
+		feedback: pass ? "" : findings.map((f) => f.detail).join(" "),
+	};
+	const rel = join(VERDICT_DIR, `implement-scope-check__${basename(latest.handle.path, ".md")}.json`);
+	mkdirSync(join(cwd, VERDICT_DIR), { recursive: true });
+	writeFileSync(join(cwd, rel), JSON.stringify(data, null, 2), "utf-8");
+	return { kind: "json", artifacts: [{ handle: { kind: "fs", path: rel } }], data };
+};
 
 /** A design filename encodes its slice as `…slice-<N>…` — the design-fanout naming convention. */
 const DESIGN_SLICE_RE = /slice-(\d+)/;
@@ -1775,6 +2275,81 @@ const COMMIT_BASELINE_PROMPT: PromptFn = ({ state }) => {
 	return baseline ? `/skill:commit --baseline ${baseline}` : "/skill:commit";
 };
 
+// ===========================================================================
+// vet — goal → code-review → (blueprint → implement → implement-scope-check
+//       → validate → loop) | commit. Examine existing changes; capture the
+//       brief as a goal artifact, review, and if not approved blueprint a fix
+//       plan, implement it, scope-check it, validate, and re-review. Loops
+//       until approved. NOTE: defined here (after captureGoal /
+//       implementScopeCheckVet) rather than beside ship/arch because its graph
+//       references those later-declared `const`s — the same precedent
+//       buildWorkflow follows (defined after its deps).
+// ===========================================================================
+
+const vetWorkflow = defineWorkflow({
+	name: "vet",
+	description:
+		"Examine existing changes for approval; loop a fix cycle if not approved. Best when a diff already exists (yours or a teammate's) and you want a structured review with optional repair. Chain: goal → code-review → (blueprint → implement → implement-scope-check → validate → loop) → commit.",
+	start: "goal",
+	stages: {
+		// Capture the user's brief verbatim on its own `goal` channel, and snapshot
+		// the run-start pre-existing-dirty paths (role "baseline"). Reuses build's
+		// `captureGoal` verbatim — no new function — so the scope-check's
+		// `reads: ["plans", "goal"]` resolves a baseline to subtract and the goal md
+		// rides the channel face. `goal` as start publishes the goal-md as
+		// `artifacts[0]`; `code-review` is a plain `produces()` SKILL stage (skill
+		// defaults to its stage key "code-review"), so it inherits that goal-md PATH
+		// as its rolling primary — the same pattern arch/polish's code-review uses,
+		// and the fallback Risk r1's note conceded "likely tolerates a goal-md-path
+		// arg." The goal-md's CONTENT is the brief (`captureGoal` writes
+		// `state.originalInput` into it), so the skill still reaches it.
+		//
+		// NOTE: the plan's r1 resolution made code-review PROMPT-dispatched to
+		// preserve `state.originalInput` byte-for-byte, but that is REVERSED here: a
+		// prompt stage carries NO skill, so the `code-review` contract no longer
+		// attaches its `outputSchema` and the `blockers_count` gate would read
+		// UNVALIDATED data (NaN-route risk, not just a warning). Keeping it a skill
+		// stage keeps `skill="code-review"` → contract schema attaches → validated.
+		goal: produces.script({ run: captureGoal }),
+		"code-review": produces(),
+		blueprint: produces(),
+		// Phase 2's dep-gated DAG variant (unpinned by Phase 3): implement phases now
+		// carry `id: phase-<n>` + `deps` derived from each phase's `files:` overlap /
+		// authored `depends_on`, so the host cap may fan them out in parallel.
+		implement: acts({ loop: IMPLEMENT_DAG_FANOUT, reads: ["plans"] }),
+		// Deterministic scope floor (no LLM): the lane may write ONLY the union of
+		// every plan iteration's declared `files:` (vet's loop pushes DISTINCT
+		// non-superseding fix plans, so the declared set is the UNION over the full
+		// `plans` history — `implementScopeCheckVet`). The `from` form suppresses
+		// the READS_DATA outputSchema lint, so no schema is declared, matching
+		// `slice-check`/`plan-cite-check`. Pass → validate; fail/missing → STOP
+		// (no fallback), mirroring build's `validate → commit` route.
+		"implement-scope-check": produces.script({ reads: ["plans", "goal"], run: implementScopeCheckVet }),
+		validate: produces(),
+		commit: acts({ outcome: gitCommitOutcome }),
+	},
+	edges: {
+		goal: "code-review",
+		// Same numeric gate as build/arch/polish: zero remaining blockers → commit;
+		// any blockers → loop a fix pass through blueprint. The `blockers_count`
+		// field is sourced + validated from the code-review contract.
+		"code-review": gate("blockers_count", { blueprint: gt(0), commit: eq(0) }, "commit"),
+		blueprint: "implement",
+		// Scope-check inserts BEFORE validate, INSIDE the review-fix loop. Pass →
+		// validate; fail/missing terminates (STOP, no fallback). Byte-for-byte
+		// Phase 3's build route.
+		implement: "implement-scope-check",
+		"implement-scope-check": match("verdict", { validate: "pass" }, { from: "implement-scope-check" }),
+		// Backward edge: validate → code-review creates the review-fix loop —
+		// UNCHANGED. The scope-check inserts before validate, so a failing scope
+		// verdict halts before re-review, and a passing one flows into validate and
+		// back to code-review exactly as today. Bounded by the runner's default
+		// maxBackwardJumps (2 → at most 3 review iterations).
+		validate: "code-review",
+		commit: "stop",
+	},
+});
+
 const buildWorkflow = defineWorkflow({
 	name: "build",
 	description:
@@ -1916,7 +2491,16 @@ const buildWorkflow = defineWorkflow({
 			outcome: rpivBucketOutcome("plans"),
 			reads: ["plans", fanin("code-verdicts"), fanin("code-cite-check")],
 		}),
-		implement: acts({ loop: IMPLEMENT_PHASE_FANOUT, reads: ["plans"] }),
+		implement: acts({ loop: IMPLEMENT_DAG_FANOUT, reads: ["plans"] }),
+		// Lane-level scope floor — the structural backstop beneath the quality
+		// gates. After the (now concurrent) implement lane lands, judge the working
+		// tree's dirty set against the plan's declared write-set: any undeclared
+		// write is a phase that escaped the upstream write-scope discipline and
+		// raced on a sibling's in-flight edit. Fail ⇒ STOP (no fix arm). The `from`
+		// form suppresses the READS_DATA outputSchema lint, so no schema is declared
+		// (matching slice-check/plan-cite-check). Reads `goal` for the run-start
+		// baseline that subtracts pre-existing dirt.
+		"implement-scope-check": produces.script({ reads: ["plans", "goal"], run: implementScopeCheck }),
 		validate: produces({ prompt: VALIDATE_GOAL_PROMPT }),
 		commit: acts({ prompt: COMMIT_BASELINE_PROMPT, outcome: gitCommitOutcome }),
 	},
@@ -2016,7 +2600,18 @@ const buildWorkflow = defineWorkflow({
 			{ readsData: false },
 		),
 		"code-fix": "code-cite-check",
-		implement: "validate",
+		implement: "implement-scope-check",
+		// Lane-level scope floor gate. Pass ⇒ validate. A `fail` (undeclared write)
+		// or a missing verdict routes to STOP — no fix arm, because a scope violation
+		// is plan-vs-tree drift the agent must reconcile manually (a phase wrote
+		// outside its declared set), not a defect an auto-fix loop can repair. Safe
+		// by construction: the sole path onward is an explicit `verdict: "pass"`, so
+		// un-anticipated data can never route INTO validate. Sourced from the
+		// scope-check's published verdict channel via the `from` form (the stage key
+		// for an outcome-less `produces.script`, per `resolvePublishName`), which
+		// suppresses the READS_DATA outputSchema lint — no schema declared (matching
+		// `validate`'s `from: "validation"` route and slice-check/plan-cite-check).
+		"implement-scope-check": match("verdict", { validate: "pass" }, { from: "implement-scope-check" }),
 		// Gate commit on validate's own verdict — an unconditional `validate → commit`
 		// let a `verdict: fail` (incomplete goal coverage) commit anyway. `match` with
 		// no fallback commits ONLY on an explicit `verdict: "pass"`; every other value
