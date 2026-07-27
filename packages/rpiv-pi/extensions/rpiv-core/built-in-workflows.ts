@@ -1342,11 +1342,22 @@ const phaseBodySlices = (content: string): Map<number, string> => {
 /** Strip a trailing `:line` or `:line-line` citation suffix from a path token. */
 const stripLineSuffix = (p: string): string => p.replace(/:\d+(?:-\d+)?$/, "");
 
+/** Well-known extensionless filenames — the extension heuristic below would drop
+ *  them, so an undeclared write to one would silently escape the coverage floor.
+ *  Recognized bare or as the basename of a path. */
+const EXTENSIONLESS_FILENAME_RE =
+	/^(?:Makefile|Dockerfile|Rakefile|Gemfile|Justfile|Procfile|LICENSE|NOTICE|CODEOWNERS)$/;
+
 /** Path-like test mirroring slice-overlap.mjs's `looksLikePath`, applied AFTER
  *  stripping a `:line` suffix (the blueprint MODIFY heading — `#### N. path/to/file.ext`
- *  with a `:12-30` range appended — carries a line range the bare form rejects). */
-const isPathLike = (s: string): boolean =>
-	/\.[A-Za-z0-9]+$/.test(s) && (s.includes("/") || /^[\w.-]+\.[A-Za-z0-9]+$/.test(s));
+ *  with a `:12-30` range appended — carries a line range the bare form rejects).
+ *  Extensionless recognition is allowlist-only (never "any `/`-bearing token"):
+ *  prose like `and/or` must not read as a declared write. */
+const isPathLike = (s: string): boolean => {
+	if (/\s/.test(s)) return false;
+	if (EXTENSIONLESS_FILENAME_RE.test(s.slice(s.lastIndexOf("/") + 1))) return true;
+	return /\.[A-Za-z0-9]+$/.test(s) && (s.includes("/") || /^[\w.-]+\.[A-Za-z0-9]+$/.test(s));
+};
 
 /**
  * Extract the edit paths a phase body names, across the three artifact
@@ -1589,6 +1600,10 @@ const implementScopeCheck = ({ state, cwd }: ScriptContext): Omit<Output, "meta"
 		findings,
 		feedback: pass ? "" : findings.map((f) => f.detail).join(" "),
 	};
+	// Basename-keyed, NOT round-stamped (unlike grade's timestamped slug): each
+	// fix-loop round overwrites the file. Deliberate — the route reads the
+	// accumulating channel, and on disk only the latest round's scope verdict
+	// matters; round-stamp here if a consumer ever needs the history.
 	const rel = join(VERDICT_DIR, `implement-scope-check__${basename(latest.handle.path, ".md")}.json`);
 	mkdirSync(join(cwd, VERDICT_DIR), { recursive: true });
 	writeFileSync(join(cwd, rel), JSON.stringify(data, null, 2), "utf-8");
@@ -1714,6 +1729,10 @@ const implementScopeCheckVet = ({ state, cwd }: ScriptContext): Omit<Output, "me
 		findings,
 		feedback: pass ? "" : findings.map((f) => f.detail).join(" "),
 	};
+	// Basename-keyed, NOT round-stamped (unlike grade's timestamped slug): each
+	// fix-loop round overwrites the file. Deliberate — the route reads the
+	// accumulating channel, and on disk only the latest round's scope verdict
+	// matters; round-stamp here if a consumer ever needs the history.
 	const rel = join(VERDICT_DIR, `implement-scope-check__${basename(latest.handle.path, ".md")}.json`);
 	mkdirSync(join(cwd, VERDICT_DIR), { recursive: true });
 	writeFileSync(join(cwd, rel), JSON.stringify(data, null, 2), "utf-8");

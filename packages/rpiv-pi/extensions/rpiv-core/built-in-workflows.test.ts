@@ -2615,6 +2615,31 @@ describe("plan-time coverage floor (verifyPhaseFilesCoverage via plan-cite-check
 		expect(data.findings).toEqual([]);
 	});
 
+	it("flags an undeclared extensionless write (Makefile) — the extension heuristic must not drop it", () => {
+		const rel = ".rpiv/artifacts/plans/p.md";
+		const data = runOn(
+			write(
+				rel,
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: One, files: [] }\n---\n# Plan\n## Phase 1: One\n### Changes\n- \`Makefile\` — add the check target\n**File**: packages/rpiv-btw/Dockerfile\n`,
+			),
+		);
+		expect(data.pass).toBe(false);
+		expect(findingDetails(data)).toMatch(/Makefile/);
+		expect(findingDetails(data)).toMatch(/packages\/rpiv-btw\/Dockerfile/);
+	});
+
+	it("passes a declared extensionless write, and prose with a slash never reads as a path", () => {
+		const rel = ".rpiv/artifacts/plans/p.md";
+		const data = runOn(
+			write(
+				rel,
+				`---\nstatus: ready\nphase_count: 1\nphases:\n  - { n: 1, title: One, files: ["Makefile"] }\n---\n# Plan\n## Phase 1: One\n### Changes\n- \`Makefile\` — either/or and/or update the target\n`,
+			),
+		);
+		expect(data.pass).toBe(true);
+		expect(data.findings).toEqual([]);
+	});
+
 	it("ignores paths inside a fenced code block (post-code-splice safety)", () => {
 		const rel = ".rpiv/artifacts/plans/p.md";
 		const data = runOn(
