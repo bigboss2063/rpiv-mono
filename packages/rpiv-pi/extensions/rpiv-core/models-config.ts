@@ -343,9 +343,10 @@ export function resolveStageModel(
  * value (non-integer, < 1).
  *
  * NOTE: `Value.Clean` (typebox@1.3.6) does NOT strip invalid scalars — it only
- * strips unknown keys and coerces `null` → `undefined` — so a configured
- * `maxConcurrency: 0` / `-1` / `4.5` / `"4"` survives schema validation. This
- * guard is therefore the fail-soft boundary, not the schema's `minimum: 1`.
+ * strips unknown keys, leaving `null` in place — so a configured
+ * `maxConcurrency: 0` / `-1` / `4.5` / `"4"` / `null` survives schema
+ * validation. This guard is therefore the fail-soft boundary, not the schema's
+ * `minimum: 1`. (`undefined` reaches the guard only from an absent key.)
  */
 export function resolveMaxConcurrency(config: ModelsConfig): number {
 	const v = config.maxConcurrency;
