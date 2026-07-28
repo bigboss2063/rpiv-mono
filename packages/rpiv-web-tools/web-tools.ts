@@ -309,13 +309,16 @@ function buildEmptyResultsEnvelope(query: string, providerName: string) {
 // ---------------------------------------------------------------------------
 
 export function registerWebSearchTool(pi: ExtensionAPI): void {
-	const guidance = validateGuidanceFields(loadConfig().guidance?.web_search);
+	const config = loadConfig();
+	const guidance = validateGuidanceFields(config.guidance?.web_search);
+	const activeProviderName = resolveActiveProviderName(config).name;
 
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web for information. Returns a list of results with titles, URLs, and snippets. Use when you need current information not in your training data.",
+			"Search the web for information. Returns a list of results with titles, URLs, and snippets. Use when you need current information not in your training data. " +
+			`The currently configured active provider is "${activeProviderName}"; omit the provider argument to use it. Only pass provider to deliberately switch backends.`,
 		promptSnippet: guidance.promptSnippet ?? DEFAULT_WEB_SEARCH_SNIPPET,
 		promptGuidelines: guidance.promptGuidelines ?? DEFAULT_WEB_SEARCH_GUIDELINES,
 		parameters: Type.Object({
@@ -660,9 +663,10 @@ export function registerWebSearchConfigCommand(pi: ExtensionAPI): void {
 					return;
 				}
 				ctx.ui.notify(
-					result.baseUrl
+					(result.baseUrl
 						? `Saved ${selectedMeta.label} config (url: ${result.baseUrl}) to ${CONFIG_PATH}`
-						: `Saved ${selectedMeta.label} config to ${CONFIG_PATH}`,
+						: `Saved ${selectedMeta.label} config to ${CONFIG_PATH}`) +
+						`\nSwitched to ${selectedMeta.label}. Reload (/reload) the session for the model to see the new active search provider.`,
 					"info",
 				);
 				return;
@@ -705,9 +709,10 @@ export function registerWebSearchConfigCommand(pi: ExtensionAPI): void {
 				return;
 			}
 			ctx.ui.notify(
-				trimmed
+				(trimmed
 					? `Saved ${selectedMeta.label} API key to ${CONFIG_PATH}`
-					: `Active provider set to ${selectedMeta.label}; existing key kept`,
+					: `Active provider set to ${selectedMeta.label}; existing key kept`) +
+					`\nSwitched to ${selectedMeta.label}. Reload (/reload) the session for the model to see the new active search provider.`,
 				"info",
 			);
 		},
